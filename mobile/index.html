@@ -685,7 +685,41 @@ function renderBot(){
 }
 
 /* ---------------- polling ---------------- */
-function startPolling(){ if(!S.timer){ refresh(); S.timer=setInterval(tick,5000); } }
+/* Live means live without being asked. Five seconds while you are looking at
+   it; a slower beat when you are not, because a phone in a pocket should not
+   spend battery and data on a screen nobody can see. */
+const POLL_WATCHING = 5000, POLL_POCKET = 30000;
+
+function startPolling(every){
+  if(every) S.pollEvery = every;
+  clearInterval(S.timer);
+  S.timer = setInterval(tick, S.pollEvery || POLL_WATCHING);
+  refresh();                       // never wait a whole beat for the first one
+}
+
+/* A phone freezes a page it has put away, and the timer with it. Coming back
+   to a screen showing numbers from an hour ago looks like a broken app, so
+   returning to the foreground refetches at once rather than waiting. The same
+   goes for a network that has just come back. */
+function wakeUp(){
+  if(!S.linked || !S.accountId || !S.token) return;
+  startPolling(document.hidden ? POLL_POCKET : POLL_WATCHING);
+}
+document.addEventListener("visibilitychange", wakeUp);
+window.addEventListener("online", wakeUp);
+window.addEventListener("pageshow", wakeUp);      // returning via the back button
+
+/* Nothing above helps if polling never began — a flaky moment during startup
+   used to leave the app sitting there for good, with a reload the only way
+   out. It keeps trying instead. */
+setInterval(()=>{
+  if(S.linked && S.accountId && S.token && !S.timer) startPolling();
+}, 15000);
+
+/* "Updated 4s ago" has to keep counting between fetches, or it freezes at
+   whatever it said when the last one landed and becomes the very thing it
+   was added to prevent. Only while the screen is being looked at. */
+setInterval(()=>{ if(S.linked && !document.hidden) renderConn(); }, 1000);
 
 async function refresh(){
   if(!S.accountId||!S.token) return;
@@ -726,6 +760,7 @@ async function refresh(){
     ]);
 
     if(info.status==="fulfilled"){
+      S.lastOk = Date.now();       // the balance is what "up to date" means here
       S.balance=info.value.balance; S.equity=info.value.equity;
       if(!S.startEquity) S.startEquity=info.value.equity;
       const day=new Date().toISOString().slice(0,10);
@@ -783,13 +818,29 @@ async function refresh(){
 const rows=(t,p)=>$(t).innerHTML=p.map(([k,v,c])=>
   `<div class="row"><span class="k">${k}</span><span class="v ${c||""}">${v}</span></div>`).join("");
 
+/* Numbers on a screen say nothing about their own age. Without this, stale
+   figures and live ones look identical, which is the whole reason a person
+   reaches for reload. */
+function freshness(){
+  if(!S.lastOk) return ["Updated","—",""];
+  const secs = Math.round((Date.now()-S.lastOk)/1000);
+  const when = secs<10 ? "just now"
+             : secs<60 ? secs+"s ago"
+             : secs<3600 ? Math.round(secs/60)+" min ago"
+             : new Date(S.lastOk).toLocaleTimeString();
+  // a beat and a half of grace before calling it stale
+  const late = secs > (S.pollEvery||POLL_WATCHING)/1000*3;
+  return ["Updated", when, late?"warn":"good"];
+}
+
 function renderConn(){
   rows("connRows",[
     ["State", S.state||"—", S.state==="DEPLOYED"?"good":"bad"],
     ["Broker link", S.conn||"—", S.conn==="CONNECTED"?"good":"warn"],
     ["Region", S.region||"—"],
     ["Balance", S.balance?S.balance.toFixed(2):"—"],
-    ["Equity", S.equity?S.equity.toFixed(2):"—"]
+    ["Equity", S.equity?S.equity.toFixed(2):"—"],
+    freshness()
   ]);
 }
 
@@ -957,12 +1008,24 @@ $("inToken").value = S.token;
   const saved = JSON.parse(localStorage.getItem("sentinal.account")||"null");
   if(saved && saved.id && S.token){
     S.accountId = saved.id;
-    try{
-      const a = await api(`${PROV}/users/current/accounts/${S.accountId}`);
-      S.account=a; S.region=a.region||"new-york"; S.state=a.state; S.conn=a.connectionStatus;
-      if(a.state==="DEPLOYED"){ S.linked=true; showLinked(); startPolling(); }
-      else { setMtStatus(`${a.state} — reconnect to continue`,"off"); }
-    }catch(e){ setMtStatus("Saved account unreachable","off"); showErr("mtErr",e.message); }
+
+    /* The account is already linked — the token and the id are both here, so
+       nothing needs entering again. All this does is find out what state it
+       is in, and a bad moment on the network is no reason to make someone
+       sign in again. It keeps asking, backing off as it goes, and picks up by
+       itself the moment the answer arrives. */
+    const attach = async (wait) => {
+      try{
+        const a = await api(`${PROV}/users/current/accounts/${S.accountId}`);
+        S.account=a; S.region=a.region||"new-york"; S.state=a.state; S.conn=a.connectionStatus;
+        if(a.state==="DEPLOYED"){ S.linked=true; showLinked(); startPolling(); }
+        else { setMtStatus(`${a.state} — reconnect to continue`,"off"); }
+      }catch(e){
+        setMtStatus(`Reconnecting to your saved account… (${e.message.split("\n")[0]})`,"busy");
+        setTimeout(()=>attach(Math.min(wait*2, 60000)), wait);
+      }
+    };
+    await attach(5000);
   }
 })();
 </script>
