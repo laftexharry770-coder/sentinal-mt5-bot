@@ -406,8 +406,12 @@ async function suggestSymbols(wanted){
     const near = all.filter(s => letters(s).startsWith(want) || want.startsWith(letters(s)));
     const gold = near.length ? near : all.filter(s => letters(s).includes("XAU"));
     if(!gold.length) return `This account lists ${all.length} symbols and none resemble ${wanted}.`;
-    return `Your broker calls it ${gold.slice(0,6).join(", ")}`
-         + `${gold.length>6?" (and others)":""} — put one in Settings → Symbol.`;
+    if(gold.length===1) return `Your broker calls it ${gold[0]} — put that in Settings → Symbol.`;
+    /* Spelled out one per line, because a comma-separated row reads like
+       something to paste in whole, and one of them is what is wanted. */
+    return `Your broker offers ${gold.length} like it. Put ONE in Settings → Symbol:\n`
+         + gold.slice(0,6).map(s=>`  ${s}`).join("\n")
+         + (gold.length>6?`\n  …and ${gold.length-6} more`:"");
   }catch(e){ return ""; }
 }
 
@@ -669,6 +673,18 @@ async function refresh(){
   if(!S.accountId||!S.token) return;
   $("connErr").classList.add("hidden");
   const c=cfg();
+
+  /* One instrument, not a list. When the app offers several names it is
+     inviting a choice, and a choice pasted in whole is not a symbol any
+     broker will recognise. Better to say so than to quietly trade whichever
+     one happened to be first. */
+  if(/[,;\s]/.test(c.symbol)){
+    renderConn();
+    showErr("connErr",
+      `Settings → Symbol holds more than one name:\n  ${c.symbol}\n` +
+      `Enter exactly one of them. Nothing will trade until it is a single symbol.`);
+    renderBot(); return;
+  }
   try{
     const a = await api(`${PROV}/users/current/accounts/${S.accountId}`);
     S.account=a; S.region=a.region||S.region; S.state=a.state; S.conn=a.connectionStatus;
