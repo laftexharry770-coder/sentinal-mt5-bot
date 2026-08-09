@@ -348,17 +348,25 @@
 ------------------------------------------------------------------- */
 const PROV = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
 
-/* An account running on a replica reports its region as something like
-   "backup-new-york". That says where the terminal is, not an address the
-   client API answers on, so the host is built from the plain region name.
-   Both spellings are tried — one wasted request beats a screen with no
-   balance on it. */
-const apiRegion = r => String(r||"").replace(/^backup-/,"") || "new-york";
-const clientBase = r => `https://mt-client-api-v1.${apiRegion(r)}.agiliumtrade.agiliumtrade.ai`;
+/* The two APIs sit on different domains, and the difference is easy to miss.
+   Provisioning is under agiliumtrade.agiliumtrade.ai. The regional client API
+   is under agiliumtrade.ai — one agiliumtrade, not two.
+
+   Getting that wrong does not fail loudly. Everything under the doubled name
+   resolves, including names that plainly do not exist, so a request for the
+   client API landed on a catch-all that had nothing to say and the browser
+   reported nothing more useful than "Failed to fetch". Under the correct
+   domain there is no wildcard: each region has its own record and its own
+   address, and a region that does not exist does not resolve at all.
+
+   The region is taken exactly as the account reports it. "backup-new-york"
+   is a real region with a real endpoint of its own, not a label to tidy up. */
+const clientBase = r => `https://mt-client-api-v1.${r||"new-york"}.agiliumtrade.ai`;
 const clientHosts = r => {
   const hosts = [clientBase(r)];
-  const raw = `https://mt-client-api-v1.${r}.agiliumtrade.agiliumtrade.ai`;
-  if (r && raw !== hosts[0]) hosts.push(raw);
+  // only if a replica ever reports a region that has no endpoint of its own
+  const plain = String(r||"").replace(/^backup-/,"");
+  if (plain && plain !== r) hosts.push(clientBase(plain));
   return hosts;
 };
 
