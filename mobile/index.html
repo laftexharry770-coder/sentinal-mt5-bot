@@ -347,7 +347,43 @@
    body so a wrong server name or a bad password says exactly that.
 ------------------------------------------------------------------- */
 const PROV = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
-const clientBase = r => `https://mt-client-api-v1.${r}.agiliumtrade.agiliumtrade.ai`;
+
+/* An account running on a replica reports its region as something like
+   "backup-new-york". That says where the terminal is, not an address the
+   client API answers on, so the host is built from the plain region name.
+   Both spellings are tried — one wasted request beats a screen with no
+   balance on it. */
+const apiRegion = r => String(r||"").replace(/^backup-/,"") || "new-york";
+const clientBase = r => `https://mt-client-api-v1.${apiRegion(r)}.agiliumtrade.agiliumtrade.ai`;
+const clientHosts = r => {
+  const hosts = [clientBase(r)];
+  const raw = `https://mt-client-api-v1.${r}.agiliumtrade.agiliumtrade.ai`;
+  if (r && raw !== hosts[0]) hosts.push(raw);
+  return hosts;
+};
+
+/* fetch() rejects outright — "Failed to fetch" — only when a request never
+   reaches the server: wrong host, blocked, or refused by CORS. That is the
+   one case worth trying elsewhere. A real HTTP reply, even an error one, is
+   an answer, so it is handed straight back.
+
+   A failed fetch does not prove the server never got the request, only that
+   no reply came back. Reading a balance twice is harmless, so those retry.
+   Sending an order twice is not, so anything that places a trade is asked
+   once, of one host, and never repeated. */
+async function apiTry(region, path, opts, once){
+  const hosts = once ? [clientBase(region)] : clientHosts(region);
+  let last;
+  for (const host of hosts){
+    try {
+      return await api(`${host}/users/current/accounts/${S.accountId}${path}`, opts);
+    } catch(e){
+      if (e.status) throw e;            // the server answered; stop guessing
+      e.triedHost = host; last = e;
+    }
+  }
+  throw last;
+}
 
 const BROKERS = {
   "Exness":       ["Exness-MT5Trial9","Exness-MT5Real","Exness-MT5Trial"],
@@ -532,6 +568,9 @@ async function waitForConnection(){
 }
 
 function showErr(id,msg){ const el=$(id); el.textContent=msg; el.classList.remove("hidden"); }
+/* A refresh that works must take the last failure off the screen, or an old
+   message sits there looking like a current one. */
+function clearErr(id){ const el=$(id); if(el){ el.textContent=""; el.classList.add("hidden"); } }
 
 function showLinked(){
   const saved = JSON.parse(localStorage.getItem("sentinal.account")||"{}");
@@ -598,19 +637,37 @@ async function refresh(){
       showErr("connErr",`Account state is ${a.state}, not DEPLOYED. Nothing can trade until it is.`);
       renderBot(); return;
     }
-    const base=clientBase(S.region), root=`${base}/users/current/accounts/${S.accountId}`;
-    const [info,price,pos] = await Promise.all([
-      api(`${root}/account-information`),
-      api(`${root}/symbols/${encodeURIComponent(c.symbol)}/current-price`),
-      api(`${root}/positions`)
+    /* These four are asked for together but stand alone. A symbol the broker
+       spells differently, or a chart that will not come, used to take the
+       balance down with it and leave the account looking dead when it was
+       fine. Each is now allowed to fail on its own, and says so by name. */
+    const sym = encodeURIComponent(c.symbol);
+    const [info,price,pos,candles] = await Promise.allSettled([
+      apiTry(S.region, `/account-information`),
+      apiTry(S.region, `/symbols/${sym}/current-price`),
+      apiTry(S.region, `/positions`),
+      apiTry(S.region, `/historical-market-data/symbols/${sym}/timeframes/${c.timeframe}/candles?limit=120`)
     ]);
-    S.balance=info.balance; S.equity=info.equity; S.price=price; S.positions=pos||[];
-    if(!S.startEquity) S.startEquity=info.equity;
-    const day=new Date().toISOString().slice(0,10);
-    if(S.dayStamp!==day){ S.dayStamp=day; S.dayStartEquity=info.equity; S.halted=""; }
 
-    const data = await api(`${root}/historical-market-data/symbols/${encodeURIComponent(c.symbol)}/timeframes/${c.timeframe}/candles?limit=120`);
-    S.candles = Array.isArray(data)?data:[];
+    if(info.status==="fulfilled"){
+      S.balance=info.value.balance; S.equity=info.value.equity;
+      if(!S.startEquity) S.startEquity=info.value.equity;
+      const day=new Date().toISOString().slice(0,10);
+      if(S.dayStamp!==day){ S.dayStamp=day; S.dayStartEquity=info.value.equity; S.halted=""; }
+    }
+    if(price.status==="fulfilled") S.price=price.value;
+    if(pos.status==="fulfilled") S.positions=pos.value||[];
+    if(candles.status==="fulfilled") S.candles=Array.isArray(candles.value)?candles.value:[];
+
+    const failed = [["Balance",info],["Price of "+c.symbol,price],
+                    ["Positions",pos],["Chart",candles]]
+      .filter(([,r])=>r.status==="rejected");
+    if(failed.length){
+      showErr("connErr", failed.map(([name,r])=>{
+        const e=r.reason||{}, host=e.triedHost?` (${new URL(e.triedHost).hostname})`:"";
+        return `${name}: ${String(e.message||e).split("\n")[0]}${host}`;
+      }).join("\n"));
+    } else clearErr("connErr");
 
     renderConn(); renderAccount(); renderPrice(); drawChart(); renderBot();
   }catch(e){
@@ -748,10 +805,9 @@ async function placeOrder(actionType){
   const tp=+(isBuy?entry+tpD:entry-tpD).toFixed(3);
 
   try{
-    const root=`${clientBase(S.region)}/users/current/accounts/${S.accountId}`;
-    const r=await api(`${root}/trade`,{method:"POST",body:JSON.stringify({
+    const r=await apiTry(S.region, `/trade`,{method:"POST",body:JSON.stringify({
       actionType, symbol:c.symbol, volume:lot, stopLoss:sl, takeProfit:tp, comment:"Sentinal"
-    })});
+    })}, true);   // once only — never risk a duplicate order
     log(`${isBuy?"BUY":"SELL"} ${lot} @ ${entry} · SL ${sl} · TP ${tp}${r&&r.orderId?` #${r.orderId}`:""}`,"ok");
   }catch(e){
     log(`Order rejected: ${e.message.split("\n")[0]}`,"bad");
