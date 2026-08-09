@@ -362,6 +362,17 @@ const PROV = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
    The region is taken exactly as the account reports it. "backup-new-york"
    is a real region with a real endpoint of its own, not a label to tidy up. */
 const clientBase = r => `https://mt-client-api-v1.${r||"new-york"}.agiliumtrade.ai`;
+/* Past prices are not served by the same API as everything else — they have
+   their own. A live quote for a symbol can work while its candles 404,
+   because the two questions are being put to two different places. Both are
+   offered, nearest first, so whichever holds the history answers. */
+const marketDataBase = r => `https://mt-market-data-client-api-v1.${r||"new-york"}.agiliumtrade.ai`;
+const historyHosts = r => {
+  const plain = String(r||"").replace(/^backup-/,"");
+  const list = [marketDataBase(r)];
+  if (plain && plain !== r) list.push(marketDataBase(plain));
+  return list.concat(clientHosts(r));
+};
 const clientHosts = r => {
   const hosts = [clientBase(r)];
   // only if a replica ever reports a region that has no endpoint of its own
@@ -415,18 +426,25 @@ async function suggestSymbols(wanted){
   }catch(e){ return ""; }
 }
 
-async function apiTry(region, path, opts, once){
-  const hosts = once ? [clientBase(region)] : clientHosts(region);
+async function apiTryHosts(hosts, path, opts, alsoOn404){
   let last;
   for (const host of hosts){
     try {
       return await api(`${host}/users/current/accounts/${S.accountId}${path}`, opts);
     } catch(e){
-      if (e.status) throw e;            // the server answered; stop guessing
       e.triedHost = host; last = e;
+      /* A server that answers has settled the question — except when the
+         question was put to the wrong API. Asking one service for something
+         another one holds earns a 404 that says nothing about the request,
+         so where two services might hold it, a 404 is worth carrying on for. */
+      if (e.status && !(alsoOn404 && e.status===404)) throw e;
     }
   }
   throw last;
+}
+
+async function apiTry(region, path, opts, once){
+  return apiTryHosts(once ? [clientBase(region)] : clientHosts(region), path, opts);
 }
 
 const BROKERS = {
@@ -702,7 +720,9 @@ async function refresh(){
       apiTry(S.region, `/account-information`),
       apiTry(S.region, `/symbols/${sym}/current-price`),
       apiTry(S.region, `/positions`),
-      apiTry(S.region, `/historical-market-data/symbols/${sym}/timeframes/${c.timeframe}/candles?limit=120`)
+      apiTryHosts(historyHosts(S.region),
+        `/historical-market-data/symbols/${sym}/timeframes/${c.timeframe}/candles?limit=120`,
+        undefined, true)
     ]);
 
     if(info.status==="fulfilled"){
@@ -741,7 +761,11 @@ async function refresh(){
            Brokers name the same metal differently — XAUUSD here, XAUUSDm or
            XAUUSD.raw there — and there is no guessing it from outside. The
            account knows, so ask it, and name the ones it does have. */
-        if(failed.some(([n,r])=>/^Price of|^Chart$/.test(n) && (r.reason||{}).status===404)){
+        /* Only when the live quote is the thing refused. A working price
+           proves the symbol is right, so a chart that fails alone is about
+           the history, not the name — suggesting other symbols there would
+           send someone off to change a setting that was never wrong. */
+        if(failed.some(([n,r])=>/^Price of/.test(n) && (r.reason||{}).status===404)){
           suggestSymbols(c.symbol).then(msg=>{
             if(msg) showErr("connErr", lines.concat(["", msg]).join("\n"));
           });
