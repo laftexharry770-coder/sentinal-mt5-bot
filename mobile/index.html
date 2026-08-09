@@ -371,6 +371,21 @@ const clientHosts = r => {
    no reply came back. Reading a balance twice is harmless, so those retry.
    Sending an order twice is not, so anything that places a trade is asked
    once, of one host, and never repeated. */
+/* "Failed to fetch" covers two very different faults and the browser refuses
+   to say which: a host that is not there, and a host that is there but will
+   not talk to a web page. A no-cors request tells them apart — it is allowed
+   to succeed opaquely against any server that answers at all, and only
+   rejects when nothing was reachable. Knowing which one it is decides whether
+   this is a wrong address or a wall no address will get past. */
+async function diagnose(host){
+  try {
+    await fetch(host + "/users/current/accounts", { mode:"no-cors", cache:"no-store" });
+    return "the server answered but refused this web page (CORS)";
+  } catch(_) {
+    return "no answer from " + new URL(host).hostname;
+  }
+}
+
 async function apiTry(region, path, opts, once){
   const hosts = once ? [clientBase(region)] : clientHosts(region);
   let last;
@@ -663,10 +678,22 @@ async function refresh(){
                     ["Positions",pos],["Chart",candles]]
       .filter(([,r])=>r.status==="rejected");
     if(failed.length){
-      showErr("connErr", failed.map(([name,r])=>{
-        const e=r.reason||{}, host=e.triedHost?` (${new URL(e.triedHost).hostname})`:"";
-        return `${name}: ${String(e.message||e).split("\n")[0]}${host}`;
-      }).join("\n"));
+      const lines = failed.map(([name,r])=>
+        `${name}: ${String((r.reason||{}).message||r.reason).split("\n")[0]}`);
+
+      /* When every one of them died the same way, the calls are not the
+         problem — the road to the server is. Say that once, plainly, instead
+         of repeating the same host four times. */
+      const netDead = failed.filter(([,r])=>!(r.reason||{}).status);
+      if(netDead.length===failed.length && failed.length>1){
+        const host=(failed[0][1].reason||{}).triedHost||clientBase(S.region);
+        lines.push("", `Nothing reached ${new URL(host).hostname} — checking why…`);
+        showErr("connErr", lines.join("\n"));
+        diagnose(host).then(verdict=>{
+          lines[lines.length-1] = `Cause: ${verdict}`;
+          showErr("connErr", lines.join("\n"));
+        });
+      } else showErr("connErr", lines.join("\n"));
     } else clearErr("connErr");
 
     renderConn(); renderAccount(); renderPrice(); drawChart(); renderBot();
