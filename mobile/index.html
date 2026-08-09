@@ -394,6 +394,23 @@ async function diagnose(host){
   }
 }
 
+/* Which of the broker's own symbols look like the one that was asked for.
+   Compared on letters alone, so XAUUSD finds XAUUSDm, XAUUSD.raw and
+   XAUUSD_i without needing to know any broker's house style. */
+async function suggestSymbols(wanted){
+  try{
+    const all = await apiTry(S.region, `/symbols`);
+    if(!Array.isArray(all) || !all.length) return "";
+    const letters = s => String(s).toUpperCase().replace(/[^A-Z]/g,"");
+    const want = letters(wanted);
+    const near = all.filter(s => letters(s).startsWith(want) || want.startsWith(letters(s)));
+    const gold = near.length ? near : all.filter(s => letters(s).includes("XAU"));
+    if(!gold.length) return `This account lists ${all.length} symbols and none resemble ${wanted}.`;
+    return `Your broker calls it ${gold.slice(0,6).join(", ")}`
+         + `${gold.length>6?" (and others)":""} — put one in Settings → Symbol.`;
+  }catch(e){ return ""; }
+}
+
 async function apiTry(region, path, opts, once){
   const hosts = once ? [clientBase(region)] : clientHosts(region);
   let last;
@@ -701,7 +718,19 @@ async function refresh(){
           lines[lines.length-1] = `Cause: ${verdict}`;
           showErr("connErr", lines.join("\n"));
         });
-      } else showErr("connErr", lines.join("\n"));
+      } else {
+        showErr("connErr", lines.join("\n"));
+
+        /* A 404 on the symbol is the broker saying it has never heard of it.
+           Brokers name the same metal differently — XAUUSD here, XAUUSDm or
+           XAUUSD.raw there — and there is no guessing it from outside. The
+           account knows, so ask it, and name the ones it does have. */
+        if(failed.some(([n,r])=>/^Price of|^Chart$/.test(n) && (r.reason||{}).status===404)){
+          suggestSymbols(c.symbol).then(msg=>{
+            if(msg) showErr("connErr", lines.concat(["", msg]).join("\n"));
+          });
+        }
+      }
     } else clearErr("connErr");
 
     renderConn(); renderAccount(); renderPrice(); drawChart(); renderBot();
