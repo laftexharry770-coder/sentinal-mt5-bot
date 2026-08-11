@@ -1,0 +1,54 @@
+; Sentinal live-chart input set - ACCOUNT-ADAPTIVE version, created 2026.08.12
+; Based on Sentinal.live.set (InitialLot 0.01, BAR-CLOSE signals, market break 23:50-01:10)
+; PLUS account-adaptive risk sizing (the EA scales every $ input by balance/$1000):
+;   InpStopLossUSD   = 10.0  -> 1% of balance per trade (effective ~$1.58 at $157.93)
+;   InpTakeProfitUSD = 10.0  -> 1:1 reward/risk (was $1 TP vs $2 SL, inverted)
+;   InpMartingaleMult = 1.5  -> gentler ladder (was 2.0)
+;   InpMaxRecovery    = 2    -> shorter ladder (was 3)
+; Load: right-click the EA on the chart -> Remove, re-add from Navigator ->
+; Inputs tab -> Load -> Sentinal.live.adaptive.set
+InpInitialLot=0.01
+InpStopLossUSD=10.0
+InpTakeProfitUSD=10.0
+InpLossTriggerUSD=0.0
+InpCloseAllOnProfit=false
+InpCloseAllMinUSD=1.0
+InpMartingaleMult=1.5
+InpMaxRecovery=2
+InpUseTrailingStop=false
+InpZeroLossRecovery=false
+InpRecoveryCover=1.0
+InpNewYorkOnly=false
+InpUseTimeFilter=false
+InpStartHour=0
+InpEndHour=24
+InpStrategy=0
+InpFastEMA=5
+InpSlowEMA=13
+InpRSIPeriod=14
+InpRSIOversold=30
+InpRSIOverbought=70
+InpBreakoutBars=20
+InpIntrabarSignals=false
+InpStopMode=1
+InpMaxPositions=5
+InpUseAdaptiveATR=false
+InpATRAdaptBars=50
+InpATRScaleMin=0.0
+InpATRScaleMax=2.0
+InpUseTrendFilter=false
+InpTrendTF=16388
+InpTrendEMA=200
+InpUseADX=false
+InpADXMin=20.0
+InpCloseOnReverse=false
+InpAdaptiveTrendSL=false
+InpTrendSLWiden=1.0
+InpTrendSLTighten=0.0
+InpMaxSpreadPoints=1000
+InpMaxSpreadATR=0.0
+InpUseMarketBreak=true
+InpBreakStartHour=23
+InpBreakStartMin=50
+InpBreakEndHour=1
+InpBreakEndMin=10
