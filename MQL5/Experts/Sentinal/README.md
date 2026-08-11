@@ -22,13 +22,21 @@ York session, and immediate intrabar execution.
 | Session | New York only |
 | Execution | Intrabar — fires the moment a signal appears |
 
-**`InpAutoTrade` still ships as `false`.** It is the one switch you turn on
-yourself, so that dragging the EA onto a chart is never the act that starts
-trading the account. Set it to `true` and it runs.
+**The Inputs dialog shows exactly nine settings** — Trade Settings, Martingale
+Settings, Session — matching the AXIOM layout. Everything else (magic number,
+max positions, daily target, loss cap, spread filter, balance scaling, EMA
+periods) is fixed inside the EA at the values above.
 
-The volatility-based mode is still available — set `InpUseDollarStops` and
-`InpUseMartingale` to `false` for ATR-scaled stops with percent-of-balance
-sizing, and turn `InpUseTrendFilter` back on for higher-timeframe filtering.
+**The on/off switch is MT5's own "Allow Algo Trading" checkbox** on the Common
+tab, plus the toolbar Algo Trading button — the same as the reference EA. Attach
+with the box unticked and it monitors; tick it and it trades. There is no
+separate auto-trade input any more.
+
+The New York session is defined in **GMT (13:00–22:00)** and checked against
+`TimeGMT()`, so it is correct on any broker without calibration. The panel's
+Time row shows your local clock with the window translated into it — in Nairobi
+that reads `NY 16:00-01:00`. (The Strategy Tester approximates GMT from server
+time, so backtests can sit a couple of hours off; live trading is exact.)
 
 ## Why this replaces the MetaApi work
 
@@ -303,3 +311,72 @@ Run **Strategy Tester** first, then **demo**. The panel tags the account
 Risk defaults to 1% per trade with an ATR-scaled stop, which is survivable
 through a losing run. The EA will not start with risk-based sizing and no stop,
 because without a stop there is no defined risk to size against.
+
+## Why the ladder distances are pinned to the initial lot
+
+Stop, target and trail distances are all derived from `InpInitialLot`, never
+from the escalated lot.
+
+Derive them from the current lot and the martingale cancels itself out exactly.
+Doubling the lot halves the price distance needed for the same dollar amount, so
+at recovery step 3 a win pays one unit of target while three losses cost three
+units of stop — the recovery can never recover. Pinning the distances means 0.08
+lots reaching the same target pays 8 × $1 = $8, covering the $6 lost getting
+there.
+
+The consequence is that **money at risk escalates with the ladder**, which is
+what a martingale is:
+
+| Step | Lot | Risk | Cumulative |
+|---|---|---|---|
+| 0 | 0.01 | $2 | $2 |
+| 1 | 0.02 | $4 | $6 |
+| 2 | 0.04 | $8 | $14 |
+| 3 | 0.08 | $16 | $30 |
+
+The panel's `Risk` row prints both the next entry's exposure and the full
+ladder's, as cash and as a share of balance, and flags `OVER CAP` when the
+ladder exceeds `InpMaxLossPctBal`.
+
+## Scaling to the account balance
+
+`$2` and `0.01` are not amounts, they are a shape: on a $1,000 account they mean
+*risk 0.2% to make 0.1% at the broker minimum lot*. Left fixed, that shape decays
+— the same $2 is 0.04% of a $5,000 account, and the bot would be trading pocket
+change while the balance grew.
+
+`InpScaleToBalance` (default on) multiplies the **lot** by
+`balance / InpRefBalance`, read live on every entry. `InpRefBalance` says which
+balance the dollar settings were written for — $1,000 by default.
+
+The price distances are deliberately *not* scaled. They come from the unscaled
+reference pair, so the stop and target sit exactly where they always did and the
+bot keeps trading the same shape of move. Only the size behind them changes.
+
+| Balance | Factor | Base lot | Full ladder | % of balance |
+|---|---|---|---|---|
+| $200 | ×0.20 | 0.01 | $30 | 15.0% |
+| $500 | ×0.50 | 0.01 | $30 | 6.0% |
+| $1,013 | ×1.01 | 0.01 | $30 | 3.0% |
+| $2,500 | ×2.50 | 0.02 | $60 | 2.4% |
+| $10,000 | ×10.0 | 0.10 | $300 | 3.0% |
+| $50,000 | ×50.0 | 0.49 | $1,470 | 2.9% |
+
+Above the reference the exposure holds at roughly 3% of balance per full failed
+ladder, growing in cash and staying flat in percentage — which is the point.
+
+**Below the reference it cannot.** The broker's 0.01 minimum lot is a hard
+floor, so a $500 account risks 6% per ladder and a $200 account risks 15%, no
+matter what the settings say. That is arithmetic, not a setting to fix. The
+panel's `Scale` row shows the factor and the base lot and marks it
+`(at broker minimum)` whenever the floor is what is binding:
+
+```
+Scale:  x1.01  base lot 0.01
+Scale:  x0.20  base lot 0.01  (at broker minimum)
+```
+
+`InpLossTriggerUSD` and `InpDailyProfitUSD` scale the same way, so the recovery
+trigger and the daily stop keep their meaning as the account grows. Percentage
+limits — `InpMaxLossPctBal`, `InpMaxDailyLossPct` — were already proportional
+and are unchanged.

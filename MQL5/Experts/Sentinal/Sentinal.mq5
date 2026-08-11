@@ -3,11 +3,9 @@
 //|                     Trend-adaptive Expert Advisor for MetaTrader 5 |
 //+------------------------------------------------------------------+
 #property copyright "Sentinal"
-#property version   "2.00"
+#property version   "2.05"
 #property strict
-#property description "Trend-adaptive MT5 bot. Higher-timeframe trend filter,"
-#property description "ATR volatility-scaled stops, trailing stop and reversal"
-#property description "handling. Tuned defaults for XAUUSD."
+#property description "Safer Martingale Scalper"
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -85,80 +83,93 @@ string BlockName(const int b)
 //| means the same thing on XAUUSD, EURUSD and indices alike.        |
 //| On 2-digit gold, 1 point = 0.01, so 100 points = $1.00 of price. |
 //+------------------------------------------------------------------+
-input group "=== Trading ==="
-input bool   InpAutoTrade        = false;  // Auto-trade (false = monitor only)
-input long   InpMagicNumber      = 770001; // Magic number
-input int    InpMaxPositions     = 5;      // Maximum simultaneous positions
-
-input group "=== Trend adaptation ==="
-input bool   InpUseTrendFilter   = false;  // Only trade with the higher-TF trend
-input ENUM_TIMEFRAMES InpTrendTF = PERIOD_H4; // Trend timeframe
-input int    InpTrendEMA         = 200;    // Trend EMA period
-input bool   InpUseADX           = false;  // Require a trending market
-input int    InpADXPeriod        = 14;     // ADX period
-input double InpADXMin           = 20.0;   // Min ADX to trade
-input bool   InpCloseOnReverse   = true;   // Close position when trend flips
-
-input group "=== Entry ==="
-input bool   InpIntrabarSignals  = true;   // React inside the candle (executes immediately)
-input EDirection InpDirection    = DIR_BOTH;        // Allowed trade direction
-input EStrategy InpStrategy      = STRAT_EMA_CROSS; // Entry strategy
-input int    InpFastEMA          = 12;     // EMA cross: fast period
-input int    InpSlowEMA          = 26;     // EMA cross: slow period
-input int    InpRSIPeriod        = 14;     // RSI: period
-input int    InpRSIOversold      = 30;     // RSI: oversold level
-input int    InpRSIOverbought    = 70;     // RSI: overbought level
-input int    InpBreakoutBars     = 20;     // Breakout: lookback bars
-
+//+------------------------------------------------------------------+
+//| Visible inputs — exactly the AXIOM-style dialog, nothing else.   |
+//| The on/off switch is MT5's own "Allow Algo Trading" checkbox on  |
+//| the Common tab, the same as the reference EA.                    |
+//+------------------------------------------------------------------+
 input group "=== Trade Settings ==="
-input bool   InpUseDollarStops   = true;   // Use $ stop/target instead of ATR
 input double InpInitialLot       = 0.01;   // Initial lot size (MINIMUM)
 input double InpStopLossUSD      = 2.0;    // Stop loss per trade ($)
 input double InpTakeProfitUSD    = 1.0;    // Take profit per trade ($)
 input double InpLossTriggerUSD   = 0.5;    // Loss to trigger recovery ($)
 
 input group "=== Martingale Settings ==="
-input bool   InpUseMartingale    = true;   // Enable martingale recovery
 input double InpMartingaleMult   = 2.0;    // Martingale multiplier
 input int    InpMaxRecovery      = 3;      // Maximum recovery attempts
+input bool   InpUseTrailingStop  = true;   // Use trailing stop
 
 input group "=== Session ==="
 input bool   InpNewYorkOnly      = true;   // Trade the New York session only
-input int    InpNYStartHour      = 15;     // NY session start (server time)
-input int    InpNYEndHour        = 24;     // NY session end (server time)
 
-input group "=== Risk (all % of live balance) ==="
-input double InpDailyProfitUSD   = 100.0;  // Daily profit target ($, 0 = off)
-input double InpMaxLossPctBal    = 50.0;   // Max total loss (% of balance, 0 = off)
-input bool   InpUseRiskPercent   = true;   // Size by risk % (false = fixed lots)
-input double InpRiskPercent      = 1.0;    // Target risk per trade (%)
-input double InpMaxRiskPercent   = 5.0;    // Hard ceiling per trade (%, 0 = never exceed target)
-input double InpMaxTotalRiskPct  = 6.0;    // Max combined open risk (%, 0 = off)
-input double InpMaxDailyLossPct  = 5.0;    // Halt for the day after this loss (%, 0 = off)
-input double InpFixedLots        = 0.01;   // Fixed lot size (when not sizing by risk)
+//+------------------------------------------------------------------+
+//| Fixed configuration — identical functionality, no longer shown   |
+//| in the Inputs dialog. Names unchanged so every code path below   |
+//| compiles exactly as before.                                      |
+//+------------------------------------------------------------------+
+const bool   InpAutoTrade        = true;    // gate is the Algo Trading checkbox now
+const long   InpMagicNumber      = 770001;
+const int    InpMaxPositions     = 5;
 
-input group "=== Stops (ATR-scaled) ==="
-input bool   InpUseATRStops      = true;   // Scale stops to live volatility
-input int    InpATRPeriod        = 14;     // ATR period
-input double InpATRStopMult      = 2.0;    // Stop = ATR x this
-input double InpATRTargetMult    = 3.0;    // Target = ATR x this
-input int    InpStopLossPoints   = 3000;   // Fixed stop (points, if ATR off)
-input int    InpTakeProfitPoints = 6000;   // Fixed target (points, if ATR off)
-input bool   InpUseTrailingStop  = true;   // Trail the stop as price moves
-input double InpATRTrailMult     = 2.0;    // Trail distance = ATR x this
+const bool   InpUseTrendFilter   = false;
+const ENUM_TIMEFRAMES InpTrendTF = PERIOD_H4;
+const int    InpTrendEMA         = 200;
+const bool   InpUseADX           = false;
+const int    InpADXPeriod        = 14;
+const double InpADXMin           = 20.0;
+const bool   InpCloseOnReverse   = true;
 
-input group "=== Filters ==="
-input int    InpMaxSpreadPoints  = 500;    // Max spread (points, 0 = ignore)
-input double InpMaxSpreadATR     = 0.5;    // Max spread as fraction of ATR (0 = ignore)
-input double InpTargetProfitPct  = 0.0;    // Halt at profit (% of start balance, 0 = off)
-input bool   InpUseTimeFilter    = false;  // Restrict trading hours
-input int    InpStartHour        = 0;      // Start hour (server time)
-input int    InpEndHour          = 24;     // End hour (server time)
+const bool   InpIntrabarSignals  = true;
+const EDirection InpDirection    = DIR_BOTH;
+const EStrategy  InpStrategy     = STRAT_EMA_CROSS;
+const int    InpFastEMA          = 12;
+const int    InpSlowEMA          = 26;
+const int    InpRSIPeriod        = 14;
+const int    InpRSIOversold      = 30;
+const int    InpRSIOverbought    = 70;
+const int    InpBreakoutBars     = 20;
 
-input group "=== Display ==="
-input bool   InpVerboseLog       = true;   // Log why each bar did/didn't trade
-input bool   InpShowPanel        = true;   // Show status panel
-input color  InpPanelColor       = clrWhite; // Panel text colour
+const bool   InpScaleToBalance   = true;    // dollar settings scale to live balance
+const double InpRefBalance       = 1000.0;  // ...written for a $1000 account
+
+const bool   InpUseDollarStops   = true;
+const bool   InpUseMartingale    = true;
+const double InpTrailStartUSD    = 0.5;
+const double InpTrailDistUSD     = 0.5;
+
+// The New York session is defined in GMT, not server time, so it stays
+// correct on any broker. 13:00-22:00 GMT is the NY trading day, which is
+// 16:00-01:00 in Nairobi (EAT, GMT+3).
+const int    InpNYStartHour      = 13;      // GMT
+const int    InpNYEndHour        = 22;      // GMT
+
+const double InpDailyProfitUSD   = 100.0;
+const double InpMaxLossPctBal    = 50.0;
+const bool   InpUseRiskPercent   = true;
+const double InpRiskPercent      = 1.0;
+const double InpMaxRiskPercent   = 5.0;
+const double InpMaxTotalRiskPct  = 6.0;
+const double InpMaxDailyLossPct  = 5.0;
+const double InpFixedLots        = 0.01;
+
+const bool   InpUseATRStops      = true;
+const int    InpATRPeriod        = 14;
+const double InpATRStopMult      = 2.0;
+const double InpATRTargetMult    = 3.0;
+const int    InpStopLossPoints   = 3000;
+const int    InpTakeProfitPoints = 6000;
+const double InpATRTrailMult     = 2.0;
+
+const int    InpMaxSpreadPoints  = 500;
+const double InpMaxSpreadATR     = 0.5;
+const double InpTargetProfitPct  = 0.0;
+const bool   InpUseTimeFilter    = false;
+const int    InpStartHour        = 0;
+const int    InpEndHour          = 24;
+
+const bool   InpVerboseLog       = true;
+const bool   InpShowPanel        = true;
+const color  InpPanelColor       = clrWhite;
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -323,6 +334,9 @@ bool ValidateInputs()
    if(InpUseTimeFilter && (InpStartHour < 0 || InpEndHour > 24 || InpStartHour >= InpEndHour))
      { Print("Sentinal: need 0 <= StartHour < EndHour <= 24."); return(false); }
 
+   if(InpScaleToBalance && InpRefBalance <= 0.0)
+     { Print("Sentinal: InpRefBalance must be > 0 when scaling to balance."); return(false); }
+
    if(InpUseDollarStops)
      {
       if(InpInitialLot <= 0.0)
@@ -417,11 +431,12 @@ void OnTick()
    if(InpDailyProfitUSD > 0.0 && !g_dayHalted && g_dayStartBalance > 0.0)
      {
       double dayProfit = AccountInfoDouble(ACCOUNT_EQUITY) - g_dayStartBalance;
-      if(dayProfit >= InpDailyProfitUSD)
+      double dayTarget = ScaledUSD(InpDailyProfitUSD);
+      if(dayProfit >= dayTarget)
         {
          g_dayHalted = true;
          PrintFormat("Sentinal: daily profit target %.2f reached (%.2f). Done for today.",
-                     InpDailyProfitUSD, dayProfit);
+                     dayTarget, dayProfit);
         }
      }
 
@@ -711,8 +726,15 @@ void OpenTrade(const ENUM_ORDER_TYPE type)
          return;
         }
 
-      stopDist   = UsdToPriceDist(InpStopLossUSD,   lots);
-      targetDist = UsdToPriceDist(InpTakeProfitUSD, lots);
+      // Distances are pinned to the INITIAL lot, not the escalated one.
+      // Derive them from the current lot instead and the martingale
+      // cancels itself out exactly: doubling the lot would halve the
+      // price distance, so a win at step 3 pays one unit of target while
+      // three losses cost three units of stop. Fixed distances mean 0.08
+      // lots pays eight times the target, which is what lets a recovery
+      // actually recover.
+      stopDist   = UsdToPriceDist(InpStopLossUSD,   InpInitialLot);
+      targetDist = UsdToPriceDist(InpTakeProfitUSD, InpInitialLot);
 
       double minDist = MinStopDistance();
       if(stopDist   < minDist) stopDist   = minDist;
@@ -923,7 +945,7 @@ void UpdateRecoveryState()
                  + HistoryDealGetDouble(ticket, DEAL_SWAP)
                  + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
 
-      if(net < -InpLossTriggerUSD)
+      if(net < -ScaledUSD(InpLossTriggerUSD))
         {
          if(g_recoveryStep < InpMaxRecovery)
            {
@@ -949,14 +971,57 @@ void UpdateRecoveryState()
   }
 
 //+------------------------------------------------------------------+
+//| Balance scaling.                                                 |
+//|                                                                  |
+//| The dollar settings describe a shape, not an amount: $2 risked to |
+//| make $1 on a $1000 account is 0.2% to make 0.1%. Multiplying the  |
+//| LOT by balance/reference keeps those percentages constant at any  |
+//| account size, while the price distances - derived from the        |
+//| unscaled reference pair - stay exactly where they were, so the    |
+//| bot goes on trading the same shape of move it always did.         |
+//+------------------------------------------------------------------+
+double BalanceFactor()
+  {
+   if(!InpScaleToBalance || InpRefBalance <= 0.0)
+      return(1.0);
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance <= 0.0)
+      return(1.0);
+
+   return(balance / InpRefBalance);
+  }
+
+// A dollar setting expressed at the live balance.
+double ScaledUSD(const double usd)
+  {
+   return(usd * BalanceFactor());
+  }
+
+// The base lot before any martingale escalation.
+double BaseLot()
+  {
+   return(NormalizeLots(InpInitialLot * BalanceFactor()));
+  }
+
+//+------------------------------------------------------------------+
 //| Lot size for the fixed-lot / martingale path                     |
 //+------------------------------------------------------------------+
 double MartingaleLots()
   {
-   double lots = InpInitialLot;
+   double lots = BaseLot();
    if(InpUseMartingale && g_recoveryStep > 0)
-      lots = InpInitialLot * MathPow(InpMartingaleMult, g_recoveryStep);
+      lots = BaseLot() * MathPow(InpMartingaleMult, g_recoveryStep);
    return(NormalizeLots(lots));
+  }
+
+//+------------------------------------------------------------------+
+//| What one trade actually risks right now, in account currency     |
+//+------------------------------------------------------------------+
+double RiskPerTrade(const double lots)
+  {
+   double d = UsdToPriceDist(InpStopLossUSD, InpInitialLot);
+   return(MoneyPerLot(d) * lots);
   }
 
 //+------------------------------------------------------------------+
@@ -973,9 +1038,11 @@ bool MaxTotalLossHit()
   }
 
 //+------------------------------------------------------------------+
-//| New York session. Hours are SERVER time, which is usually not    |
-//| your local time — the panel prints the server clock so the       |
-//| window can be calibrated against it.                             |
+//| New York session, checked against GMT rather than server time,   |
+//| so the window is correct on any broker without calibration. The  |
+//| panel translates it to the local clock. (In the Strategy Tester  |
+//| GMT is approximated from server time, so backtests may sit a     |
+//| couple of hours off — live trading is exact.)                    |
 //+------------------------------------------------------------------+
 bool WithinNewYorkSession()
   {
@@ -983,7 +1050,7 @@ bool WithinNewYorkSession()
       return(true);
 
    MqlDateTime t;
-   TimeToStruct(TimeCurrent(), t);
+   TimeToStruct(TimeGMT(), t);
 
    if(InpNYStartHour <= InpNYEndHour)
       return(t.hour >= InpNYStartHour && t.hour < InpNYEndHour);
@@ -1096,13 +1163,40 @@ void ManageOpenPositions()
          continue;
         }
 
-      if(!InpUseTrailingStop || atr <= 0.0)
+      if(!InpUseTrailingStop)
          continue;
 
-      double trailDist = MathMax(atr * InpATRTrailMult, MinStopDistance());
-      double current   = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
-                               : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double newSL     = isBuy ? current - trailDist : current + trailDist;
+      // The trail must be denominated the same way the stop is. An ATR
+      // trail against a $2 stop and $1 target is tens of dollars wide, so
+      // it could never tighten before the target hit — the setting would
+      // read "true" and do nothing at all.
+      double trailDist, startDist;
+      if(InpUseDollarStops)
+        {
+         // Pinned to the initial lot for the same reason the stop is, so
+         // the trail stays the same price distance as the ladder climbs.
+         trailDist = UsdToPriceDist(InpTrailDistUSD,  InpInitialLot);
+         startDist = UsdToPriceDist(InpTrailStartUSD, InpInitialLot);
+        }
+      else
+        {
+         if(atr <= 0.0)
+            continue;
+         trailDist = atr * InpATRTrailMult;
+         startDist = 0.0;
+        }
+      trailDist = MathMax(trailDist, MinStopDistance());
+
+      double current = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                             : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      // Only start trailing once the trade is far enough into profit.
+      double profitDist = isBuy ? current - position.PriceOpen()
+                                : position.PriceOpen() - current;
+      if(profitDist < startDist)
+         continue;
+
+      double newSL = isBuy ? current - trailDist : current + trailDist;
       newSL = NormalizeDouble(newSL, _Digits);
 
       double oldSL = position.StopLoss();
@@ -1283,34 +1377,75 @@ void PanelUpdate()
              DoubleToString(equity, 2) + "   P/L " +
              DoubleToString(equity - g_startBalance, 2));
 
-   // What the smallest tradeable position would risk right now, as a
-   // share of the live balance. This is the number that decides whether
-   // a signal becomes a trade on a small account.
-   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
-   double minLotPct = 0.0;
-   if(atr > 0.0 && balance > 0.0)
-     {
-      double sd     = (InpUseATRStops ? atr * InpATRStopMult
-                                      : InpStopLossPoints * _Point);
-      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      minLotPct     = MoneyPerLot(sd) * minLot / balance * 100.0;
-     }
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
 
-   bool affordable = (minLotPct > 0.0 && minLotPct <= InpMaxRiskPercent);
-   PanelLine(row++, "Risk", (minLotPct > 0.0 && !affordable ? clrOrangeRed : InpPanelColor),
-             StringFormat("%.1f%% target | min lot %.2f%% | ceiling %.1f%%%s",
-                          InpRiskPercent, minLotPct, InpMaxRiskPercent,
-                          (minLotPct > 0.0 && !affordable ? "  (NO TRADES)" : "")));
+   if(InpUseDollarStops)
+     {
+      // With distances pinned to the initial lot, the money at risk now
+      // scales with the ladder — which is what a martingale is. Show what
+      // the next entry stands to lose and what a full failed sequence
+      // costs, so the escalation is visible before it happens.
+      double nextRisk = RiskPerTrade(MartingaleLots());
+      double ladder   = 0.0;
+      if(InpUseMartingale)
+         for(int k = 0; k <= InpMaxRecovery; k++)
+            ladder += RiskPerTrade(NormalizeLots(BaseLot() * MathPow(InpMartingaleMult, k)));
+      else
+         ladder = nextRisk;
+
+      double ladderPct = (balance > 0.0) ? ladder / balance * 100.0 : 0.0;
+      bool   heavy     = (InpMaxLossPctBal > 0.0 && ladderPct > InpMaxLossPctBal);
+
+      PanelLine(row++, "Risk", (heavy ? clrOrangeRed : InpPanelColor),
+                StringFormat("next %.2f  |  full ladder %.2f (%.1f%%)%s",
+                             nextRisk, ladder, ladderPct,
+                             (heavy ? "  OVER CAP" : "")));
+
+      if(InpScaleToBalance)
+        {
+         double f      = BalanceFactor();
+         double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         bool   pinned = (InpInitialLot * f < minLot);
+         PanelLine(row++, "Scale", (pinned ? clrGold : InpPanelColor),
+                   StringFormat("x%.2f  base lot %.2f%s",
+                                f, BaseLot(),
+                                (pinned ? "  (at broker minimum)" : "")));
+        }
+     }
+   else
+     {
+      // ATR mode: whether the smallest tradeable position fits the risk
+      // budget is what decides if a signal becomes a trade at all.
+      double minLotPct = 0.0;
+      if(atr > 0.0 && balance > 0.0)
+        {
+         double sd     = atr * InpATRStopMult;
+         double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         minLotPct     = MoneyPerLot(sd) * minLot / balance * 100.0;
+        }
+      bool affordable = (minLotPct > 0.0 && minLotPct <= InpMaxRiskPercent);
+      PanelLine(row++, "Risk", (minLotPct > 0.0 && !affordable ? clrOrangeRed : InpPanelColor),
+                StringFormat("%.1f%% target | min lot %.2f%% | ceiling %.1f%%%s",
+                             InpRiskPercent, minLotPct, InpMaxRiskPercent,
+                             (minLotPct > 0.0 && !affordable ? "  (NO TRADES)" : "")));
+     }
    PanelLine(row++, "Open risk", InpPanelColor,
              StringFormat("%.2f%% / %.1f%%", OpenRiskPercent(), InpMaxTotalRiskPct));
 
    MqlDateTime st;
    TimeToStruct(TimeCurrent(), st);
-   PanelLine(row++, "Server", InpPanelColor,
-             StringFormat("%02d:%02d%s", st.hour, st.min,
+   // Shown in the LOCAL clock — the machine's own timezone — with the
+   // NY window translated into it, so no mental conversion is needed.
+   TimeToStruct(TimeLocal(), st);
+   int offH = (int)MathRound((double)(TimeLocal() - TimeGMT()) / 3600.0);
+   int nyLo = ((InpNYStartHour + offH) % 24 + 24) % 24;
+   int nyHi = ((InpNYEndHour   + offH) % 24 + 24) % 24;
+   PanelLine(row++, "Time", (InpNewYorkOnly && !WithinNewYorkSession()
+                             ? clrGold : InpPanelColor),
+             StringFormat("%02d:%02d local%s", st.hour, st.min,
                           (InpNewYorkOnly
-                           ? (WithinNewYorkSession() ? "   NY session OPEN"
-                                                     : "   outside NY session")
+                           ? StringFormat("   NY %02d:00-%02d:00 %s", nyLo, nyHi,
+                                          (WithinNewYorkSession() ? "OPEN" : "closed"))
                            : "")));
 
    if(InpUseMartingale)
