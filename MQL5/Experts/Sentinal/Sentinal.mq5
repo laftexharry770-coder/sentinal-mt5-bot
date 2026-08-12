@@ -785,7 +785,12 @@ double TrendSLFactor(const int signalDir)
 
    if(widen)
       return(MathMax(InpTrendSLWiden, 1.0));
-   return(MathMin(InpTrendSLTighten, 1.0));
+
+// Floored at 0.1: this multiplies the stop distance, so a tighten value
+// of 0 would collapse the stop to zero and every entry would be rejected
+// with "could not convert $ stop into a price distance" - a silent, total
+// block from one innocuous-looking setting.
+   return(MathMax(MathMin(InpTrendSLTighten, 1.0), 0.1));
   }
 
 //| Entry signals — all read CLOSED candles only                     |
