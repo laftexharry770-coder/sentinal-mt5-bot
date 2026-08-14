@@ -1,0 +1,62 @@
+; Sentinal TRIPLE-RESONANCE preset - ported from the mt5-trading skill (Babata V6.6)
+; Attach to XAUUSD M15. Three layers must agree before an entry is taken:
+;   H4 macro trend  - InpUseTrendFilter with InpTrendTF = H4 (16388)
+;   M15 micro signal- EMA 5/13 cross on the chart timeframe, bar-close only
+;   MACD momentum   - histogram must be expanding in the signal's direction
+; Exits use Infinite RR: no fixed target, breakeven at 2R, then trail the
+; previous bar's low/high so a winner is closed by the move ending, not by
+; a ceiling set at entry.
+InpInitialLot=0.01
+InpStopLossUSD=10.0
+InpTakeProfitUSD=10.0
+InpLossTriggerUSD=0.0
+InpCloseAllOnProfit=false
+InpCloseAllMinUSD=1.0
+InpMartingaleMult=1.5
+InpMaxRecovery=2
+InpUseTrailingStop=false
+InpZeroLossRecovery=false
+InpRecoveryCover=1.0
+InpNewYorkOnly=false
+InpUseTimeFilter=false
+InpStartHour=0
+InpEndHour=24
+InpStrategy=0
+InpFastEMA=5
+InpSlowEMA=13
+InpRSIPeriod=14
+InpRSIOversold=30
+InpRSIOverbought=70
+InpBreakoutBars=20
+InpIntrabarSignals=false
+InpStopMode=1
+InpMaxPositions=5
+InpUseAdaptiveATR=false
+InpATRAdaptBars=50
+InpATRScaleMin=0.5
+InpATRScaleMax=2.0
+InpUseTrendFilter=true
+InpTrendTF=16388
+InpTrendEMA=200
+InpUseADX=false
+InpADXMin=20.0
+InpCloseOnReverse=true
+InpAdaptiveTrendSL=true
+InpTrendSLWiden=1.5
+InpTrendSLTighten=0.8
+InpUseMACD=true
+InpMACDFast=12
+InpMACDSlow=26
+InpMACDSignal=9
+InpUseInfiniteRR=true
+InpBreakevenAtR=2.0
+InpBEBufferR=0.1
+InpTrailBars=1
+InpWriteJournal=true
+InpMaxSpreadPoints=1000
+InpMaxSpreadATR=0.0
+InpUseMarketBreak=true
+InpBreakStartHour=23
+InpBreakStartMin=50
+InpBreakEndHour=1
+InpBreakEndMin=10

@@ -59,6 +59,7 @@ enum EBlock
    BLK_DIRECTION,
    BLK_SESSION,
    BLK_MAXLOSS,
+   BLK_MOMENTUM,
    BLK_COUNT
   };
 
@@ -93,6 +94,8 @@ string BlockName(const int b)
          return("signal against higher-TF trend");
       case BLK_DIRECTION:
          return("direction disabled (long/short filter)");
+      case BLK_MOMENTUM:
+         return("MACD momentum disagrees");
       case BLK_SESSION:
          return("outside New York session");
       case BLK_MAXLOSS:
@@ -173,6 +176,21 @@ input bool       InpAdaptiveTrendSL = true;     // Widen the stop when trading W
 input double     InpTrendSLWiden    = 1.5;      // Stop multiplier with the trend (room to breathe)
 input double     InpTrendSLTighten  = 0.8;      // Stop multiplier against the trend (tighter)
 
+input group "=== Momentum (MACD) ==="
+input bool       InpUseMACD        = true;      // Require MACD histogram to agree with the signal
+input int        InpMACDFast       = 12;        // MACD fast EMA
+input int        InpMACDSlow       = 26;        // MACD slow EMA
+input int        InpMACDSignal     = 9;         // MACD signal period
+
+input group "=== Infinite RR ==="
+input bool       InpUseInfiniteRR  = true;      // Breakeven then trail, no fixed target
+input double     InpBreakevenAtR   = 2.0;       // Move stop to entry at this multiple of risk
+input double     InpBEBufferR      = 0.1;       // Buffer past entry, in R
+input int        InpTrailBars      = 1;         // Trail behind the low/high of the last N closed bars
+
+input group "=== Journal ==="
+input bool       InpWriteJournal   = true;      // Append every closed trade to Sentinal_journal.csv
+
 input group "=== Spread Filter ==="
 input int        InpMaxSpreadPoints = 1000;      // Absolute spread cap (points); 0 = off
 input double     InpMaxSpreadATR    = 0.0;       // Spread cap as fraction of ATR; 0 = off
@@ -247,6 +265,15 @@ double   g_startBalance    = 0.0;
 bool     g_halted          = false;
 datetime g_lastBar         = 0;
 datetime g_lastEntryBar   = 0;      // the bar the last entry happened on
+
+int      g_hMACD           = INVALID_HANDLE;
+
+// Per-position state for the Infinite RR ladder. Max positions is small,
+// so a flat array with a linear scan is cheaper than anything cleverer.
+#define  RR_SLOTS 64
+ulong    g_rrTicket[RR_SLOTS];
+double   g_rrRisk[RR_SLOTS];        // initial entry-to-stop distance, in price
+bool     g_rrBE[RR_SLOTS];          // breakeven already taken
 datetime g_lastEntryTime   = 0;      // exact time of the last entry deal
 
 double   g_dayStartBalance = 0.0;   // balance at the start of the current day
@@ -363,6 +390,8 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_hTrend);
    if(g_hADX   != INVALID_HANDLE)
       IndicatorRelease(g_hADX);
+   if(g_hMACD  != INVALID_HANDLE)
+      IndicatorRelease(g_hMACD);
 
    EventKillTimer();
    ObjectsDeleteAll(0, PANEL_PREFIX);
@@ -454,6 +483,19 @@ bool ValidateInputs()
    if(InpScaleToBalance && InpRefBalance <= 0.0)
      { Print("Sentinal: InpRefBalance must be > 0 when scaling to balance."); return(false); }
 
+   if(InpUseMACD && (InpMACDFast >= InpMACDSlow || InpMACDFast < 1 || InpMACDSignal < 1))
+     { Print("Sentinal: need 1 <= MACD fast < slow, and signal >= 1."); return(false); }
+
+   if(InpUseInfiniteRR)
+     {
+      if(InpBreakevenAtR <= 0.0)
+        { Print("Sentinal: InpBreakevenAtR must be > 0."); return(false); }
+      if(InpTrailBars < 1)
+        { Print("Sentinal: InpTrailBars must be >= 1."); return(false); }
+      if(InpBEBufferR < 0.0)
+        { Print("Sentinal: InpBEBufferR cannot be negative."); return(false); }
+     }
+
    if(InpStopMode == STOP_DOLLAR)
      {
       if(InpInitialLot <= 0.0)
@@ -535,7 +577,76 @@ bool CreateIndicators()
         { Print("Sentinal: ADX handle failed. err=", GetLastError()); return(false); }
      }
 
+   if(InpUseMACD)
+     {
+      g_hMACD = iMACD(_Symbol, PERIOD_CURRENT, InpMACDFast, InpMACDSlow,
+                      InpMACDSignal, PRICE_CLOSE);
+      if(g_hMACD == INVALID_HANDLE)
+        { Print("Sentinal: MACD handle failed. err=", GetLastError()); return(false); }
+     }
+
    return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Momentum confirmation.                                           |
+//|                                                                  |
+//| An EMA cross says direction changed; it says nothing about        |
+//| whether anything is behind the move. A rising MACD histogram is   |
+//| momentum building, a falling one is a cross happening into a      |
+//| fading move - which is where fast crosses on gold produce most    |
+//| of their losers.                                                  |
+//+------------------------------------------------------------------+
+bool MomentumAgrees(const ESignal sig)
+  {
+   if(!InpUseMACD || g_hMACD == INVALID_HANDLE || sig == SIGNAL_NONE)
+      return(true);
+
+   double macdMain[], macdSig[];
+   ArraySetAsSeries(macdMain, true);
+   ArraySetAsSeries(macdSig,  true);
+
+   int s = SignalShift();
+   if(CopyBuffer(g_hMACD, 0, s, 2, macdMain) < 2) return(false);
+   if(CopyBuffer(g_hMACD, 1, s, 2, macdSig)  < 2) return(false);
+
+   double h0 = macdMain[0] - macdSig[0];   // histogram, bar being tested
+   double h1 = macdMain[1] - macdSig[1];   // the bar before it
+
+   return(sig == SIGNAL_BUY ? (h0 > h1) : (h0 < h1));
+  }
+
+//+------------------------------------------------------------------+
+//| Infinite RR bookkeeping — one slot per open position             |
+//+------------------------------------------------------------------+
+int RRSlot(const ulong ticket, const double riskIfNew)
+  {
+   int freeSlot = -1;
+   for(int i = 0; i < RR_SLOTS; i++)
+     {
+      if(g_rrTicket[i] == ticket)
+         return(i);
+      if(g_rrTicket[i] == 0 && freeSlot < 0)
+         freeSlot = i;
+     }
+   if(freeSlot < 0 || riskIfNew <= 0.0)
+      return(-1);
+
+   g_rrTicket[freeSlot] = ticket;
+   g_rrRisk[freeSlot]   = riskIfNew;
+   g_rrBE[freeSlot]     = false;
+   return(freeSlot);
+  }
+
+void RRRelease(const ulong ticket)
+  {
+   for(int i = 0; i < RR_SLOTS; i++)
+      if(g_rrTicket[i] == ticket)
+        {
+         g_rrTicket[i] = 0;
+         g_rrRisk[i]   = 0.0;
+         g_rrBE[i]     = false;
+        }
   }
 
 //+------------------------------------------------------------------+
@@ -658,6 +769,9 @@ void OnTick()
                                     else
                                        if(InpUseTrendFilter && trend != (int)signal)
                                           blk = BLK_TREND_OPPOSED;
+                                       else
+                                          if(!MomentumAgrees(signal))
+                                             blk = BLK_MOMENTUM;
                              }
 
 // Tally once per bar, so the summary's percentages stay per-bar and
@@ -1206,8 +1320,12 @@ void OpenTrade(const ENUM_ORDER_TYPE type)
       stopDist = trendMin;
 
    double sl = (type == ORDER_TYPE_BUY) ? price - stopDist : price + stopDist;
+
+   // Infinite RR runs without a fixed target: the trade is secured at
+   // breakeven and then trailed, so a winner is closed by the market
+   // running out rather than by a ceiling set at entry.
    double tp = 0.0;
-   if(targetDist > 0.0)
+   if(targetDist > 0.0 && !InpUseInfiniteRR)
       tp = (type == ORDER_TYPE_BUY) ? price + targetDist : price - targetDist;
 
    sl = NormalizeDouble(sl, _Digits);
@@ -1267,9 +1385,53 @@ void OpenTrade(const ENUM_ORDER_TYPE type)
 //| count as profit. The recovery stays elevated until the ledger is |
 //| fully cleared — that is what makes the recovery "zero-loss".     |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Blackbox journal: one row per closed deal, with the context that  |
+//| produced it. Post-mortem is impossible without this - the MT5     |
+//| history shows what happened, not what the bot believed at entry.  |
+//+------------------------------------------------------------------+
+void JournalDeal(const ulong dealTicket, const double net)
+  {
+   if(!InpWriteJournal)
+      return;
+
+   int h = FileOpen("Sentinal_journal.csv",
+                    FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(h == INVALID_HANDLE)
+      return;
+
+   FileSeek(h, 0, SEEK_END);
+   if(FileSize(h) == 0)
+      FileWrite(h, "close_time", "symbol", "type", "volume", "price",
+                "net", "balance", "equity", "recovery_step", "debt",
+                "spread_pts", "atr_pts", "strategy", "intrabar");
+
+   double atr = AdaptiveATR();
+   FileWrite(h,
+             TimeToString((datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME),
+                          TIME_DATE | TIME_SECONDS),
+             HistoryDealGetString(dealTicket, DEAL_SYMBOL),
+             (HistoryDealGetInteger(dealTicket, DEAL_TYPE) == DEAL_TYPE_BUY ? "buy" : "sell"),
+             DoubleToString(HistoryDealGetDouble(dealTicket, DEAL_VOLUME), 2),
+             DoubleToString(HistoryDealGetDouble(dealTicket, DEAL_PRICE), _Digits),
+             DoubleToString(net, 2),
+             DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+             DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+             IntegerToString(g_recoveryStep),
+             DoubleToString(g_recoveryDebt, 2),
+             DoubleToString(CurrentSpreadPoints(), 0),
+             DoubleToString((atr > 0.0 ? atr / _Point : 0.0), 0),
+             EnumToString(InpStrategy),
+             (InpIntrabarSignals ? "yes" : "no"));
+
+   FileClose(h);
+  }
+
 void UpdateRecoveryState()
   {
-   if(!InpUseMartingale && !InpZeroLossRecovery)
+   // The journal and the RR slot release both ride on this deal scan, so
+   // it has to run even when neither recovery mode is active.
+   if(!InpUseMartingale && !InpZeroLossRecovery && !InpWriteJournal && !InpUseInfiniteRR)
       return;
 
    if(!HistorySelect(g_lastDealTime, TimeCurrent() + 60))
@@ -1296,6 +1458,10 @@ void UpdateRecoveryState()
       double net = HistoryDealGetDouble(ticket, DEAL_PROFIT)
                    + HistoryDealGetDouble(ticket, DEAL_SWAP)
                    + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+
+      // The position is gone: free its Infinite RR slot and record it.
+      RRRelease((ulong)HistoryDealGetInteger(ticket, DEAL_POSITION_ID));
+      JournalDeal(ticket, net);
 
       // Zero-loss ledger: postpone losses, repay with profits.
       if(InpZeroLossRecovery)
@@ -1551,6 +1717,63 @@ void ManageOpenPositions()
             PrintFormat("Sentinal: failed to close #%I64u. retcode=%d",
                         position.Ticket(), trade.ResultRetcode());
          continue;
+        }
+
+      // ---- Infinite RR: breakeven first, then run behind the bars ----
+      if(InpUseInfiniteRR)
+        {
+         double entry = position.PriceOpen();
+         double curSL = position.StopLoss();
+         double cur   = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                              : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+         int slot = RRSlot(position.Ticket(),
+                           (curSL > 0.0 ? MathAbs(entry - curSL) : 0.0));
+         if(slot < 0)
+            continue;                       // no risk recorded, nothing to measure against
+
+         double R          = g_rrRisk[slot];
+         double profitDist = isBuy ? cur - entry : entry - cur;
+
+         // Phase 1 — secure the trade at breakeven plus a buffer.
+         if(!g_rrBE[slot] && profitDist >= InpBreakevenAtR * R)
+           {
+            double be = isBuy ? entry + InpBEBufferR * R
+                              : entry - InpBEBufferR * R;
+            be = NormalizeDouble(be, _Digits);
+
+            bool ok = isBuy ? (be < cur && (curSL <= 0.0 || be > curSL))
+                            : (be > cur && (curSL <= 0.0 || be < curSL));
+            if(ok && trade.PositionModify(position.Ticket(), be, position.TakeProfit()))
+              {
+               g_rrBE[slot] = true;
+               PrintFormat("Sentinal: #%I64u to breakeven at %.1fR (SL %s).",
+                           position.Ticket(), InpBreakevenAtR,
+                           DoubleToString(be, _Digits));
+              }
+           }
+
+         // Phase 2 — moon run: trail behind the recent bars' extreme.
+         if(g_rrBE[slot])
+           {
+            MqlRates r[];
+            ArraySetAsSeries(r, true);
+            int need = MathMax(InpTrailBars, 1) + 2;
+            if(CopyRates(_Symbol, PERIOD_CURRENT, 0, need, r) >= need)
+              {
+               double ext = isBuy ? r[1].low : r[1].high;
+               for(int k = 2; k <= MathMax(InpTrailBars, 1); k++)
+                  ext = isBuy ? MathMin(ext, r[k].low) : MathMax(ext, r[k].high);
+
+               double newSL  = NormalizeDouble(ext, _Digits);
+               double minGap = MinStopDistance();
+               bool   valid  = isBuy ? (newSL < cur - minGap && newSL > curSL)
+                                     : (newSL > cur + minGap && newSL < curSL);
+               if(valid)
+                  trade.PositionModify(position.Ticket(), newSL, position.TakeProfit());
+              }
+           }
+         continue;                          // Infinite RR supersedes the $ trail
         }
 
       if(!InpUseTrailingStop)
