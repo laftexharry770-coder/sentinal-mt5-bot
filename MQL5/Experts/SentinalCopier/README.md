@@ -18,8 +18,25 @@ The master writes a snapshot of its open positions to
 `Common\Files\SentinalCopy\<channel>.csv`; every slave reads it. No server, no
 network, no account credentials anywhere.
 
-The consequence is the one real constraint: **all terminals must run on the same
-PC or VPS.** Copying between machines needs a relay server instead.
+That is `TRANSPORT_FILE`, and it requires all terminals on the same PC or VPS.
+
+For slaves on **other devices**, set `InpTransport` to `TRANSPORT_HTTP` on the
+master and every slave. The master then POSTs each snapshot to a relay URL and
+slaves GET it. `relay/copier_relay.py` is that relay - one file, no
+dependencies, run it on any machine the terminals can reach:
+
+```
+python3 copier_relay.py --key A-LONG-SHARED-SECRET --port 8787
+```
+
+Put the same string in `InpRelayKey` on the master and every slave, and the same
+`InpRelayUrl`. **Both terminals must whitelist the URL** in
+*Tools > Options > Expert Advisors > Allow WebRequest for listed URL*, or every
+request returns error 4014 and the slave panel says so.
+
+The relay holds only the newest snapshot per channel, in memory. It never sees an
+account password and cannot place a trade. Put it behind TLS if it faces the
+open internet - the shared key is the only thing protecting the feed.
 
 ## Latency
 
@@ -32,7 +49,7 @@ PC or VPS.** Copying between machines needs a relay server instead.
   half-written file and never has to retry.
 
 End to end on one VPS that is typically **100–250 ms** from master fill to slave
-fill. Both intervals can go to 10 ms if you want to trade CPU for speed, though
+fill; over a relay, add the round trip to wherever you host it. Both intervals can go to 10 ms if you want to trade CPU for speed, though
 below ~50 ms you are mostly measuring the brokers' own execution.
 
 What you cannot remove is the slave broker's execution time and the price
@@ -73,13 +90,45 @@ master will trade 0.01 lots where the ratio asks for 0.001, which is
 proportionally **ten times** the master's risk. `InpMaxLot` caps the other
 direction.
 
+## Pending orders
+
+Pending orders are copied as orders, not waited on and then chased as market
+entries - a straddle or breakout master holds nothing but pendings until one
+triggers.
+
+The level travels as a **distance from the master's market price** at the moment
+it published, applied to the slave broker's market now. Copying the absolute
+level would misplace the order by whatever the two brokers differ by, which on
+gold is routinely cents.
+
+When a master pending fills, its ticket carries over as the position id, so the
+copy is recognised as the same trade and is not duplicated or closed. Reversed
+copying is not applied to pendings: inverting a stop/limit straddle has no
+single sensible meaning.
+
+## Trailing stops and stop changes
+
+Stops are **re-synced every cycle**, not just at entry. Whatever moves the
+master's stop - a trailing EA, a manual drag, a break-even rule - the master
+republishes within 100 ms and the slave matches the new distance on its own
+entry.
+
+`SyncStops` compares the master's current stop distance against the copy's and
+modifies when they differ by more than 5 points, so a trailing stop follows
+continuously without spamming the broker with identical modifications.
+
 ## Symbols
 
 Resolution runs in three steps: an explicit `InpSymbolMap` entry, then the exact
 name, then a base-name match against everything the broker lists.
 
-Base matching strips the decoration, so `XAUUSD` finds `XAUUSD.m`, `XAUUSDm`,
-`XAUUSD_i` or `XAUUSD#` by itself. When it cannot, the log names the symbol it
+Base matching strips decoration, so `XAUUSD` finds `XAUUSD.m`, `XAUUSDm`,
+`XAUUSD_i` or `XAUUSD#` by itself. Brokers also rename instruments outright, so
+an alias table folds the common ones together: `GOLD`/`XAUUSD`,
+`SILVER`/`XAGUSD`, `US30`/`DJ30`/`WS30`, `NAS100`/`USTEC`/`US100`,
+`SPX500`/`US500`, `GER40`/`DAX40`, `USOIL`/`WTI`, `UKOIL`/`BRENT`,
+`BTCUSD`/`BITCOIN`. That is what lets an FxPro master trading `GOLD` feed an
+Exness slave trading `XAUUSDm`. When it cannot, the log names the symbol it
 could not place and `InpSymbolMap` takes overrides:
 
 ```

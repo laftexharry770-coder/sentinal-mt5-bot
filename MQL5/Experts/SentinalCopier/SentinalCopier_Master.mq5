@@ -13,9 +13,21 @@
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
+enum ETransport
+  {
+   TRANSPORT_FILE,   // Shared folder - same PC/VPS only, lowest latency
+   TRANSPORT_HTTP    // Relay URL - slaves on other devices
+  };
+
 input group "=== Channel ==="
-input string InpChannel        = "sentinal";  // Channel name (slaves must match)
+input string     InpChannel    = "sentinal";  // Channel name (slaves must match)
+input ETransport InpTransport  = TRANSPORT_FILE; // How slaves receive this feed
 input int    InpPublishMs      = 100;         // Heartbeat interval (ms); trades publish instantly
+
+input group "=== Relay (TRANSPORT_HTTP) ==="
+input string InpRelayUrl       = "";          // e.g. https://relay.example.com
+input string InpRelayKey       = "";          // Shared secret; must match the relay and slaves
+input int    InpHttpTimeoutMs  = 2000;        // Request timeout (ms)
 
 input group "=== Filters ==="
 input bool   InpOnlyMagic      = false;       // Publish only positions with the magic below
@@ -146,6 +158,45 @@ void Publish()
       count++;
      }
 
+   // Pending orders travel too - a straddle or breakout strategy has
+   // nothing but pending orders until one fills, so a copier that only
+   // publishes positions copies nothing at all for those.
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(InpOnlyMagic && (long)OrderGetInteger(ORDER_MAGIC) != InpMagicFilter)
+         continue;
+
+      string sym = OrderGetString(ORDER_SYMBOL);
+      if(!SymbolAllowed(sym))
+         continue;
+
+      long type = OrderGetInteger(ORDER_TYPE);
+      if(type != ORDER_TYPE_BUY_LIMIT  && type != ORDER_TYPE_SELL_LIMIT &&
+         type != ORDER_TYPE_BUY_STOP   && type != ORDER_TYPE_SELL_STOP)
+         continue;                       // market orders are already positions
+
+      // The market price at this instant travels with the order, so the
+      // slave can place its own pending the same DISTANCE from its own
+      // market rather than at an absolute level its broker may not share.
+      bool   isBuySide = (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP);
+      double market    = isBuySide ? SymbolInfoDouble(sym, SYMBOL_ASK)
+                                   : SymbolInfoDouble(sym, SYMBOL_BID);
+
+      body += StringFormat("ORD,%I64u,%s,%d,%.2f,%s,%s,%s,%I64d,%I64d,%s\n",
+                           ticket, sym, (int)type,
+                           OrderGetDouble(ORDER_VOLUME_CURRENT),
+                           DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), 8),
+                           DoubleToString(OrderGetDouble(ORDER_SL), 8),
+                           DoubleToString(OrderGetDouble(ORDER_TP), 8),
+                           (long)OrderGetInteger(ORDER_TIME_SETUP),
+                           (long)OrderGetInteger(ORDER_MAGIC),
+                           DoubleToString(market, 8));
+      count++;
+     }
+
    // Skip the write when nothing changed: the heartbeat still refreshes
    // on the interval below, but the disk stays quiet in between.
    bool sameBody = (body == g_lastBody);
@@ -195,6 +246,10 @@ void PublishStale()
 //+------------------------------------------------------------------+
 bool WriteAtomically(const string payload)
   {
+   if(InpTransport == TRANSPORT_HTTP)
+      return(PostToRelay(payload));
+
+
    int h = FileOpen(g_tmp, FILE_WRITE | FILE_BIN | FILE_COMMON);
    if(h == INVALID_HANDLE)
      {
@@ -217,6 +272,51 @@ bool WriteAtomically(const string payload)
       return(false);
      }
    return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Push the snapshot to the relay so slaves on other machines can    |
+//| read it. The URL must be whitelisted in                           |
+//| Tools > Options > Expert Advisors > Allow WebRequest.             |
+//+------------------------------------------------------------------+
+bool PostToRelay(const string payload)
+  {
+   string url = Trim(InpRelayUrl);
+   if(url == "")
+     {
+      if(g_writeFails == 0)
+         Print("Copier master: TRANSPORT_HTTP needs InpRelayUrl.");
+      return(false);
+     }
+   if(StringLen(url) > 0 && StringSubstr(url, StringLen(url) - 1) == "/")
+      url = StringSubstr(url, 0, StringLen(url) - 1);
+   url += "/publish?channel=" + Trim(InpChannel);
+
+   char post[], reply[];
+   string replyHeaders;
+   int n = StringToCharArray(payload, post, 0, WHOLE_ARRAY, CP_UTF8);
+   if(n > 0)
+      ArrayResize(post, n - 1);          // drop the trailing NUL
+
+   string headers = "Content-Type: text/plain\r\nX-Copier-Key: " + Trim(InpRelayKey) + "\r\n";
+
+   ResetLastError();
+   int code = WebRequest("POST", url, headers, InpHttpTimeoutMs, post, reply, replyHeaders);
+
+   if(code == 200)
+      return(true);
+
+   if(g_writeFails == 0)
+     {
+      if(code == -1)
+         PrintFormat("Copier master: WebRequest blocked (err %d). Add %s to "
+                     "Tools > Options > Expert Advisors > Allow WebRequest.",
+                     GetLastError(), Trim(InpRelayUrl));
+      else
+         PrintFormat("Copier master: relay returned HTTP %d - %s",
+                     code, CharArrayToString(reply, 0, MathMin(200, ArraySize(reply))));
+     }
+   return(false);
   }
 
 //+------------------------------------------------------------------+

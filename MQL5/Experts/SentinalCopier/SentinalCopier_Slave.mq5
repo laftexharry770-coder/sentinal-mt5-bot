@@ -25,10 +25,22 @@ enum ELotMode
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
+enum ETransport
+  {
+   TRANSPORT_FILE,   // Shared folder - same PC/VPS as the master
+   TRANSPORT_HTTP    // Relay URL - master on another device
+  };
+
 input group "=== Channel ==="
-input string   InpChannel       = "sentinal"; // Channel name (must match the master)
+input string     InpChannel     = "sentinal"; // Channel name (must match the master)
+input ETransport InpTransport   = TRANSPORT_FILE; // How this slave receives the feed
 input int      InpPollMs        = 100;        // How often to check for changes (ms)
 input int      InpMaxAgeSec     = 30;         // Ignore the feed if older than this
+
+input group "=== Relay (TRANSPORT_HTTP) ==="
+input string   InpRelayUrl      = "";         // Same URL the master publishes to
+input string   InpRelayKey      = "";         // Same shared secret as the master
+input int      InpHttpTimeoutMs = 2000;       // Request timeout (ms)
 
 input group "=== Sizing ==="
 input ELotMode InpLotMode       = LOT_BALANCE_RATIO; // How slave lots are derived
@@ -78,6 +90,19 @@ double   g_mSL[MAX_POS];
 double   g_mTP[MAX_POS];
 long     g_mTime[MAX_POS];
 int      g_mCount = 0;
+
+// Master pending orders. A straddle or breakout master holds nothing but
+// these until one triggers, so they have to be mirrored as orders - not
+// waited on and then chased as market entries.
+ulong    g_oTicket[MAX_POS];
+string   g_oSymbol[MAX_POS];
+int      g_oType[MAX_POS];
+double   g_oVolume[MAX_POS];
+double   g_oPrice[MAX_POS];
+double   g_oSL[MAX_POS];
+double   g_oTP[MAX_POS];
+double   g_oMarket[MAX_POS];    // master's market price when it published
+int      g_oCount = 0;
 
 // Symbol resolution cache
 string   g_cacheFrom[64];
@@ -164,6 +189,7 @@ void Cycle()
       return;
 
    ForgetClosedMasters();
+   ReconcileOrders();
    Reconcile();
   }
 
@@ -174,24 +200,11 @@ void ReadFeed()
   {
    g_feedOk  = false;
    g_mCount  = 0;
+   g_oCount  = 0;
 
-   if(!FileIsExist(g_file, FILE_COMMON))
-     { g_feedNote = "no feed file - is the master running?"; return; }
-
-   int h = FileOpen(g_file, FILE_READ | FILE_BIN | FILE_COMMON);
-   if(h == INVALID_HANDLE)
-     { g_feedNote = "feed locked, retrying"; return; }
-
-   ulong size = FileSize(h);
-   if(size == 0 || size > 1048576)
-     { FileClose(h); g_feedNote = "feed empty or oversized"; return; }
-
-   uchar bytes[];
-   ArrayResize(bytes, (int)size);
-   FileReadArray(h, bytes, 0, (int)size);
-   FileClose(h);
-
-   string text = CharArrayToString(bytes, 0, (int)size, CP_UTF8);
+   string text = (InpTransport == TRANSPORT_HTTP) ? FetchFromRelay() : ReadLocalFile();
+   if(text == "")
+      return;                            // the reader already set g_feedNote
 
    string lines[];
    int nl = StringSplit(text, '\n', lines);
@@ -217,6 +230,19 @@ void ReadFeed()
          g_mStamp   = (datetime)StringToInteger(f[6]);
          sawHeader  = true;
         }
+      else
+         if(nf >= 11 && f[0] == "ORD" && g_oCount < MAX_POS)
+           {
+            g_oTicket[g_oCount] = (ulong)StringToInteger(f[1]);
+            g_oSymbol[g_oCount] = f[2];
+            g_oType[g_oCount]   = (int)StringToInteger(f[3]);
+            g_oVolume[g_oCount] = StringToDouble(f[4]);
+            g_oPrice[g_oCount]  = StringToDouble(f[5]);
+            g_oSL[g_oCount]     = StringToDouble(f[6]);
+            g_oTP[g_oCount]     = StringToDouble(f[7]);
+            g_oMarket[g_oCount] = StringToDouble(f[10]);
+            g_oCount++;
+           }
       else
          if(nf >= 10 && f[0] == "POS" && g_mCount < MAX_POS)
            {
@@ -253,6 +279,67 @@ void ReadFeed()
 
    g_feedOk  = true;
    g_feedNote = StringFormat("live, %d s old", (int)MathMax(age, 0));
+  }
+
+//+------------------------------------------------------------------+
+//| Transport: shared folder                                         |
+//+------------------------------------------------------------------+
+string ReadLocalFile()
+  {
+   if(!FileIsExist(g_file, FILE_COMMON))
+     { g_feedNote = "no feed file - is the master running?"; return(""); }
+
+   int h = FileOpen(g_file, FILE_READ | FILE_BIN | FILE_COMMON);
+   if(h == INVALID_HANDLE)
+     { g_feedNote = "feed locked, retrying"; return(""); }
+
+   ulong size = FileSize(h);
+   if(size == 0 || size > 1048576)
+     { FileClose(h); g_feedNote = "feed empty or oversized"; return(""); }
+
+   uchar bytes[];
+   ArrayResize(bytes, (int)size);
+   FileReadArray(h, bytes, 0, (int)size);
+   FileClose(h);
+
+   return(CharArrayToString(bytes, 0, (int)size, CP_UTF8));
+  }
+
+//+------------------------------------------------------------------+
+//| Transport: relay over HTTPS, for a master on another device.     |
+//| The URL must be whitelisted in                                   |
+//| Tools > Options > Expert Advisors > Allow WebRequest.            |
+//+------------------------------------------------------------------+
+string FetchFromRelay()
+  {
+   string url = Trim(InpRelayUrl);
+   if(url == "")
+     { g_feedNote = "TRANSPORT_HTTP needs InpRelayUrl"; return(""); }
+   if(StringSubstr(url, StringLen(url) - 1) == "/")
+      url = StringSubstr(url, 0, StringLen(url) - 1);
+   url += "/feed?channel=" + Trim(InpChannel);
+
+   char post[], reply[];
+   string replyHeaders;
+   string headers = "X-Copier-Key: " + Trim(InpRelayKey) + "\r\n";
+
+   ResetLastError();
+   int code = WebRequest("GET", url, headers, InpHttpTimeoutMs, post, reply, replyHeaders);
+
+   if(code == -1)
+     {
+      int err = GetLastError();
+      g_feedNote = (err == 4014)
+                   ? "URL not allowed - whitelist it in Options"
+                   : StringFormat("relay unreachable (err %d)", err);
+      return("");
+     }
+   if(code == 404)
+     { g_feedNote = "channel not on the relay yet"; return(""); }
+   if(code != 200)
+     { g_feedNote = StringFormat("relay HTTP %d", code); return(""); }
+
+   return(CharArrayToString(reply, 0, ArraySize(reply), CP_UTF8));
   }
 
 //+------------------------------------------------------------------+
@@ -323,6 +410,132 @@ void Reconcile()
       else
          if(InpCopySLTP)
             SyncStops(slaveTicket, k);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Mirror the master's pending orders                               |
+//+------------------------------------------------------------------+
+void ReconcileOrders()
+  {
+   // Delete copies whose master order is gone - cancelled, expired, or
+   // filled and then closed. A master order that FILLED keeps its ticket
+   // as the position id, so it still shows up in the position list and
+   // this leaves our pending alone until ours fills too.
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong t = OrderGetTicket(i);
+      if(t == 0)
+         continue;
+      if((long)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
+         continue;
+
+      ulong master = MasterTicketOf(OrderGetString(ORDER_COMMENT));
+      if(master == 0)
+         continue;
+
+      if(FindMasterOrder(master) < 0 && FindMaster(master) < 0)
+        {
+         if(trade.OrderDelete(t))
+           {
+            g_closed++;
+            PrintFormat("Copier: deleted pending #%I64u (master #%I64u gone).", t, master);
+           }
+         else
+            g_errors++;
+        }
+     }
+
+   // Place the ones we are missing.
+   for(int k = 0; k < g_oCount; k++)
+     {
+      if(!SymbolAllowed(g_oSymbol[k]))
+         continue;
+      if(FindCopyOrder(g_oTicket[k]) != 0)
+         continue;                       // already have the pending
+      if(FindCopy(g_oTicket[k]) != 0)
+         continue;                       // ours already filled
+      if(AlreadyHandled(g_oTicket[k]))
+         continue;
+      if(CountCopies() + CountCopyOrders() >= InpMaxPositions)
+        {
+         g_feedNote = "position limit reached";
+         continue;
+        }
+      PlacePending(k);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Place one pending order.                                         |
+//|                                                                  |
+//| The level is copied as a DISTANCE from the master's market price  |
+//| at the moment it published, applied to this broker's market now.  |
+//| Copying the absolute level would misplace the order by whatever   |
+//| the two brokers differ by - which for gold is routinely cents.    |
+//+------------------------------------------------------------------+
+void PlacePending(const int k)
+  {
+   if(InpReverse)
+      return;      // inverting a stop/limit straddle has no clear meaning
+
+   string sym = ResolveSymbol(g_oSymbol[k]);
+   if(sym == "")
+     {
+      g_errors++;
+      PrintFormat("Copier: no local symbol matches '%s' - add it to InpSymbolMap.",
+                  g_oSymbol[k]);
+      return;
+     }
+
+   double lots = SlaveLots(g_oVolume[k], sym);
+   if(lots <= 0.0)
+     { g_errors++; return; }
+
+   int    type    = g_oType[k];
+   bool   buySide = (type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP);
+   int    digits  = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double market  = buySide ? SymbolInfoDouble(sym, SYMBOL_ASK)
+                            : SymbolInfoDouble(sym, SYMBOL_BID);
+   if(market <= 0.0 || g_oMarket[k] <= 0.0)
+     { g_errors++; return; }
+
+   double price = NormalizeDouble(market + (g_oPrice[k] - g_oMarket[k]), digits);
+
+   double sl = 0.0, tp = 0.0;
+   if(InpCopySLTP)
+     {
+      if(g_oSL[k] > 0.0)
+         sl = NormalizeDouble(price - (g_oPrice[k] - g_oSL[k]), digits);
+      if(g_oTP[k] > 0.0)
+         tp = NormalizeDouble(price - (g_oPrice[k] - g_oTP[k]), digits);
+     }
+
+   string comment = TAG + IntegerToString((long)g_oTicket[k]);
+
+   bool ok = false;
+   switch(type)
+     {
+      case ORDER_TYPE_BUY_LIMIT:  ok = trade.BuyLimit (lots, price, sym, sl, tp, 0, 0, comment); break;
+      case ORDER_TYPE_SELL_LIMIT: ok = trade.SellLimit(lots, price, sym, sl, tp, 0, 0, comment); break;
+      case ORDER_TYPE_BUY_STOP:   ok = trade.BuyStop  (lots, price, sym, sl, tp, 0, 0, comment); break;
+      case ORDER_TYPE_SELL_STOP:  ok = trade.SellStop (lots, price, sym, sl, tp, 0, 0, comment); break;
+      default: return;
+     }
+
+   if(ok)
+     {
+      g_opened++;
+      MarkHandled(g_oTicket[k]);
+      PrintFormat("Copier: pending %s %.2f %s @ %s copying master #%I64u.",
+                  EnumToString((ENUM_ORDER_TYPE)type), lots, sym,
+                  DoubleToString(price, digits), g_oTicket[k]);
+     }
+   else
+     {
+      g_errors++;
+      PrintFormat("Copier: pending failed on %s. retcode=%d (%s)",
+                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
      }
   }
 
@@ -534,15 +747,15 @@ string ResolveSymbol(const string masterSym)
          if(SymbolInfoDouble(masterSym, SYMBOL_BID) > 0.0)
             found = masterSym;
 
-   // 3. base-name match across everything the broker offers
+   // 3. canonical-base match across everything the broker offers
    if(found == "")
      {
-      string want = SymbolBase(masterSym);
+      string want = CanonicalBase(masterSym);
       int total = SymbolsTotal(false);
       for(int i = 0; i < total && found == ""; i++)
         {
          string cand = SymbolName(i, false);
-         if(SymbolBase(cand) == want)
+         if(CanonicalBase(cand) == want)
             found = cand;
         }
      }
@@ -560,6 +773,43 @@ string ResolveSymbol(const string masterSym)
       PrintFormat("Copier: '%s' resolved to '%s' on this broker.", masterSym, found);
 
    return(found);
+  }
+
+//+------------------------------------------------------------------+
+//| Brokers do not merely decorate names, they rename instruments     |
+//| outright: FxPro calls gold GOLD where Exness calls it XAUUSDm.     |
+//| Stripping suffixes can never bridge that, so equivalent names are  |
+//| folded onto one canonical base first.                              |
+//+------------------------------------------------------------------+
+string CanonicalBase(const string s)
+  {
+   string b = SymbolBase(s);
+
+   // Metals
+   if(b == "GOLD" || b == "GOLDSPOT" || b == "XAUUSD")            return("XAUUSD");
+   if(b == "SILVER" || b == "SILVERSPOT" || b == "XAGUSD")        return("XAGUSD");
+
+   // Indices
+   if(b == "US30" || b == "DJ30" || b == "DOW" || b == "DOW30" ||
+      b == "WS30" || b == "USA30")                                return("US30");
+   if(b == "NAS100" || b == "USTEC" || b == "NDX100" || b == "US100" ||
+      b == "USATEC" || b == "NASDAQ")                             return("NAS100");
+   if(b == "SPX500" || b == "US500" || b == "SP500" || b == "USA500") return("SPX500");
+   if(b == "GER40" || b == "DAX40" || b == "DE40" || b == "GER30" ||
+      b == "DAX30" || b == "DE30")                                return("GER40");
+   if(b == "UK100" || b == "FTSE100" || b == "GB100")             return("UK100");
+   if(b == "JP225" || b == "NIKKEI" || b == "JPN225")             return("JP225");
+
+   // Energy
+   if(b == "USOIL" || b == "WTI" || b == "CRUDE" || b == "XTIUSD" ||
+      b == "OILUSD" || b == "CL")                                 return("USOIL");
+   if(b == "UKOIL" || b == "BRENT" || b == "XBRUSD")              return("UKOIL");
+
+   // Crypto
+   if(b == "BTCUSD" || b == "BITCOIN")                            return("BTCUSD");
+   if(b == "ETHUSD" || b == "ETHEREUM")                           return("ETHUSD");
+
+   return(b);
   }
 
 // "XAUUSD.m" -> "XAUUSD", "XAUUSDm" -> "XAUUSD", "EURUSD_i" -> "EURUSD"
@@ -622,7 +872,7 @@ void ForgetClosedMasters()
   {
    int w = 0;
    for(int i = 0; i < g_seenN; i++)
-      if(FindMaster(g_seen[i]) >= 0)
+      if(FindMaster(g_seen[i]) >= 0 || FindMasterOrder(g_seen[i]) >= 0)
          g_seen[w++] = g_seen[i];
    g_seenN = w;
   }
@@ -633,6 +883,43 @@ int FindMaster(const ulong masterTicket)
       if(g_mTicket[i] == masterTicket)
          return(i);
    return(-1);
+  }
+
+int FindMasterOrder(const ulong masterTicket)
+  {
+   for(int i = 0; i < g_oCount; i++)
+      if(g_oTicket[i] == masterTicket)
+         return(i);
+   return(-1);
+  }
+
+ulong FindCopyOrder(const ulong masterTicket)
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong t = OrderGetTicket(i);
+      if(t == 0)
+         continue;
+      if((long)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
+         continue;
+      if(MasterTicketOf(OrderGetString(ORDER_COMMENT)) == masterTicket)
+         return(t);
+     }
+   return(0);
+  }
+
+int CountCopyOrders()
+  {
+   int n = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong t = OrderGetTicket(i);
+      if(t == 0)
+         continue;
+      if((long)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+         n++;
+     }
+   return(n);
   }
 
 ulong FindCopy(const ulong masterTicket)
