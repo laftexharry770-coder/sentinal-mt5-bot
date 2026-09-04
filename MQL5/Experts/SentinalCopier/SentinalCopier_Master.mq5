@@ -48,6 +48,7 @@ string   g_lastBody  = "";      // last payload, to skip identical rewrites
 long     g_published = 0;
 datetime g_lastWrite = 0;
 int      g_writeFails = 0;
+string   g_lastError  = "";     // shown on the panel, not only in the log
 
 const string PANEL_PREFIX = "SCM_";
 #define PROTOCOL_VERSION 1
@@ -253,6 +254,7 @@ bool WriteAtomically(const string payload)
    int h = FileOpen(g_tmp, FILE_WRITE | FILE_BIN | FILE_COMMON);
    if(h == INVALID_HANDLE)
      {
+      g_lastError = "cannot write the shared folder";
       if(g_writeFails == 0)
          PrintFormat("Copier master: cannot open %s (err %d).", g_tmp, GetLastError());
       return(false);
@@ -267,6 +269,7 @@ bool WriteAtomically(const string payload)
    FileDelete(g_file, FILE_COMMON);
    if(!FileMove(g_tmp, FILE_COMMON, g_file, FILE_COMMON | FILE_REWRITE))
      {
+      g_lastError = "cannot rename into place";
       if(g_writeFails == 0)
          PrintFormat("Copier master: cannot publish %s (err %d).", g_file, GetLastError());
       return(false);
@@ -284,6 +287,7 @@ bool PostToRelay(const string payload)
    string url = Trim(InpRelayUrl);
    if(url == "")
      {
+      g_lastError = "no relay URL set";
       if(g_writeFails == 0)
          Print("Copier master: TRANSPORT_HTTP needs InpRelayUrl.");
       return(false);
@@ -304,7 +308,18 @@ bool PostToRelay(const string payload)
    int code = WebRequest("POST", url, headers, InpHttpTimeoutMs, post, reply, replyHeaders);
 
    if(code == 200)
+     {
+      g_lastError = "";
       return(true);
+     }
+
+   int werr = GetLastError();
+   if(code == -1)
+      g_lastError = (werr == 4014)
+                    ? "URL not whitelisted in Options"
+                    : StringFormat("relay unreachable (err %d)", werr);
+   else
+      g_lastError = StringFormat("relay HTTP %d", code);
 
    if(g_writeFails == 0)
      {
@@ -374,9 +389,12 @@ void PanelUpdate()
    PanelLine(row++, "Published",clrWhite, IntegerToString((int)g_published) + " positions");
    PanelLine(row++, "Last write",clrWhite,
              (g_lastWrite > 0 ? TimeToString(g_lastWrite, TIME_SECONDS) : "never"));
+   PanelLine(row++, "Transport", clrWhite,
+             (InpTransport == TRANSPORT_HTTP ? "HTTP relay" : "shared folder"));
    if(!ok)
       PanelLine(row++, "Error", clrOrangeRed,
-                IntegerToString(g_writeFails) + " consecutive write failures");
+                (g_lastError != "" ? g_lastError : "write failing") +
+                "  (x" + IntegerToString(g_writeFails) + ")");
 
    ChartRedraw();
   }
