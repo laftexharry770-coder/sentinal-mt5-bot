@@ -146,6 +146,33 @@ Under `InpReverse` the two swap: the master's stop distance becomes the slave's
 target and vice versa, because the master's stop being hit is the price moving
 in the mirrored trade's favour.
 
+## Web control panel
+
+The relay also serves a page listing every slave, so day-to-day management
+happens in a browser instead of MT5 input dialogs. Open `http://<host>:8787/`
+and paste the relay key.
+
+Each slave shows its account, broker, state, balance, live copy count and error
+count, and carries two controls:
+
+| Control | Effect |
+|---|---|
+| **Pause / Resume** | Stops *new* copies. Closes still follow the master, so pausing never strands a copy the master has already finished with. |
+| **Multiplier** | Overrides `InpLotMode` entirely for that slave — resize one follower without restarting anything. |
+| **Max lot** | Per-trade cap for that slave, overriding `InpMaxLot`. |
+
+Slaves POST their status every `InpStatusMs` (2 s) and the control comes back in
+the same reply, so it is one request per cycle rather than two. Set
+`InpUsePanel` and either `InpPanelUrl` or `InpRelayUrl`; the panel works with
+`TRANSPORT_FILE` too, so terminals sharing a VPS can still be managed remotely.
+
+**The panel never places a trade.** It records what you want and the slave EA
+reads it — the EA remains the only thing touching any account. If the panel goes
+down, every slave keeps copying on its last known settings.
+
+A slave silent for two minutes is shown as `OFFLINE` rather than quietly
+dropping off the list.
+
 ## Safety behaviour
 
 **A stale feed never closes anything.** If the master stops publishing, the

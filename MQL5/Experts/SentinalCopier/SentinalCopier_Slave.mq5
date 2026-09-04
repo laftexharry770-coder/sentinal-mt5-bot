@@ -42,6 +42,11 @@ input string   InpRelayUrl      = "";         // Same URL the master publishes t
 input string   InpRelayKey      = "";         // Same shared secret as the master
 input int      InpHttpTimeoutMs = 2000;       // Request timeout (ms)
 
+input group "=== Control panel ==="
+input bool     InpUsePanel      = true;       // Report to the web panel and obey it
+input string   InpPanelUrl      = "";         // Panel URL; empty = use InpRelayUrl
+input int      InpStatusMs      = 2000;       // How often to report (ms)
+
 input group "=== Sizing ==="
 input ELotMode InpLotMode       = LOT_BALANCE_RATIO; // How slave lots are derived
 input double   InpMultiplier    = 1.0;        // Multiplier (LOT_MULTIPLIER)
@@ -116,6 +121,15 @@ int      g_cacheN = 0;
 ulong    g_seen[MAX_POS];
 int      g_seenN = 0;
 
+// Control from the web panel. These override the inputs while set, so a
+// slave can be paused or resized without touching the terminal.
+bool     g_paused      = false;
+double   g_ctlMult     = 0.0;    // 0 = no override
+double   g_ctlMaxLot   = 0.0;    // 0 = no override
+datetime g_lastStatus  = 0;
+bool     g_panelOk     = false;
+string   g_panelNote   = "not reporting";
+
 datetime g_started  = 0;
 int      g_opened   = 0;
 int      g_closed   = 0;
@@ -175,6 +189,7 @@ void OnTick()  { Cycle(); }
 void Cycle()
   {
    ReadFeed();
+   ReportStatus();
 
    if(InpShowPanel)
       PanelUpdate();
@@ -279,6 +294,106 @@ void ReadFeed()
 
    g_feedOk  = true;
    g_feedNote = StringFormat("live, %d s old", (int)MathMax(age, 0));
+  }
+
+//+------------------------------------------------------------------+
+//| Report to the control panel and read back what it wants.          |
+//|                                                                   |
+//| One round trip carries both: the status goes up, the pause and    |
+//| sizing overrides come back in the reply. The panel never places a  |
+//| trade - it only tells this EA what to do next, and this EA is      |
+//| still the only thing touching the account.                        |
+//+------------------------------------------------------------------+
+void ReportStatus()
+  {
+   if(!InpUsePanel)
+      return;
+   if(TimeCurrent() - g_lastStatus < (InpStatusMs / 1000))
+      return;
+   g_lastStatus = TimeCurrent();
+
+   string url = Trim(InpPanelUrl);
+   if(url == "")
+      url = Trim(InpRelayUrl);
+   if(url == "")
+     { g_panelNote = "no panel URL"; g_panelOk = false; return; }
+   if(StringSubstr(url, StringLen(url) - 1) == "/")
+      url = StringSubstr(url, 0, StringLen(url) - 1);
+   url += "/status";
+
+   string state = (!g_feedOk ? "HOLDING" : (g_paused ? "PAUSED" : "COPYING"));
+
+   string payload =
+      "account="    + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\n" +
+      "broker="     + AccountInfoString(ACCOUNT_COMPANY)                 + "\n" +
+      "state="      + state                                              + "\n" +
+      "balance="    + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n" +
+      "equity="     + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)  + "\n" +
+      "copies="     + IntegerToString(CountCopies() + CountCopyOrders())  + "\n" +
+      "masterpos="  + IntegerToString(g_mCount + g_oCount)               + "\n" +
+      "opened="     + IntegerToString(g_opened)                          + "\n" +
+      "closed="     + IntegerToString(g_closed)                          + "\n" +
+      "errors="     + IntegerToString(g_errors)                          + "\n" +
+      "feed="       + g_feedNote                                         + "\n";
+
+   char post[], reply[];
+   string replyHeaders;
+   int n = StringToCharArray(payload, post, 0, WHOLE_ARRAY, CP_UTF8);
+   if(n > 0)
+      ArrayResize(post, n - 1);
+
+   string key = Trim(InpRelayKey);
+   string headers = "Content-Type: text/plain\r\nX-Copier-Key: " + key + "\r\n";
+
+   ResetLastError();
+   int code = WebRequest("POST", url, headers, InpHttpTimeoutMs, post, reply, replyHeaders);
+
+   if(code != 200)
+     {
+      g_panelOk = false;
+      int err = GetLastError();
+      g_panelNote = (code == -1 && err == 4014)
+                    ? "panel URL not whitelisted"
+                    : StringFormat("panel HTTP %d", code);
+      return;
+     }
+
+   g_panelOk   = true;
+   g_panelNote = "connected";
+   ApplyControl(CharArrayToString(reply, 0, ArraySize(reply), CP_UTF8));
+  }
+
+//+------------------------------------------------------------------+
+//| Parse the panel's reply: paused / multiplier / maxlot            |
+//+------------------------------------------------------------------+
+void ApplyControl(const string reply)
+  {
+   string lines[];
+   int n = StringSplit(reply, '\n', lines);
+   for(int i = 0; i < n; i++)
+     {
+      string line = Trim(lines[i]);
+      int eq = StringFind(line, "=");
+      if(eq <= 0)
+         continue;
+
+      string k = StringSubstr(line, 0, eq);
+      string v = StringSubstr(line, eq + 1);
+
+      if(k == "paused")
+        {
+         bool p = (StringToInteger(v) != 0);
+         if(p != g_paused)
+            PrintFormat("Copier: panel %s this slave.", (p ? "PAUSED" : "resumed"));
+         g_paused = p;
+        }
+      else
+         if(k == "multiplier")
+            g_ctlMult = StringToDouble(v);
+         else
+            if(k == "maxlot")
+               g_ctlMaxLot = StringToDouble(v);
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -387,6 +502,9 @@ void Reconcile()
 
       if(slaveTicket == 0)
         {
+         if(g_paused)
+            continue;                   // no new copies while paused
+
          // Already opened once and no longer here: our own stop or target
          // closed it. The master still holds its position, but that is
          // finished business for us - re-entering now would be a new trade
@@ -445,6 +563,11 @@ void ReconcileOrders()
             g_errors++;
         }
      }
+
+   // Paused stops NEW copies only. Deletions above still run, so pausing
+   // never strands a copy the master has already finished with.
+   if(g_paused)
+      return;
 
    // Place the ones we are missing.
    for(int k = 0; k < g_oCount; k++)
@@ -674,6 +797,12 @@ void SyncStops(const ulong slaveTicket, const int k)
 double SlaveLots(const double masterLots, const string sym)
   {
    double lots;
+
+   // A multiplier set in the panel overrides the input entirely, so one
+   // slave can be resized from the browser without a terminal restart.
+   if(g_ctlMult > 0.0)
+      return(ClampLots(masterLots * g_ctlMult, sym));
+
    switch(InpLotMode)
      {
       case LOT_FIXED:
@@ -692,12 +821,22 @@ double SlaveLots(const double masterLots, const string sym)
          break;
      }
 
-   if(InpMaxLot > 0.0 && lots > InpMaxLot)
-      lots = InpMaxLot;
+   return(ClampLots(lots, sym));
+  }
 
-   double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-   double maxLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
-   double step    = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+//+------------------------------------------------------------------+
+//| Apply the caps and fit the result to what the broker will accept |
+//+------------------------------------------------------------------+
+double ClampLots(double lots, const string sym)
+  {
+   // The panel's cap wins when it is set, otherwise the input applies.
+   double cap = (g_ctlMaxLot > 0.0) ? g_ctlMaxLot : InpMaxLot;
+   if(cap > 0.0 && lots > cap)
+      lots = cap;
+
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
    if(step <= 0.0)
       step = 0.01;
 
@@ -990,9 +1129,15 @@ void PanelUpdate()
    string state; color col;
    if(!g_feedOk)                { state = "HOLDING";  col = clrGold;      }
    else if(!algo)               { state = "ALGO OFF"; col = clrOrangeRed; }
+   else if(g_paused)            { state = "PAUSED";   col = clrGold;      }
    else                         { state = "COPYING";  col = clrLime;      }
 
    PanelLine(row++, "Copier",  col, state + "   (" + g_feedNote + ")");
+   if(InpUsePanel)
+      PanelLine(row++, "Panel", (g_panelOk ? clrWhite : clrOrangeRed),
+                g_panelNote +
+                (g_ctlMult   > 0.0 ? StringFormat("  x%.2f", g_ctlMult) : "") +
+                (g_ctlMaxLot > 0.0 ? StringFormat("  cap %.2f", g_ctlMaxLot) : ""));
    PanelLine(row++, "Channel", clrWhite, Trim(InpChannel));
    PanelLine(row++, "Master",  clrWhite,
              (g_mAccount > 0
