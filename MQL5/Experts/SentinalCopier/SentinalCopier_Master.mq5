@@ -146,11 +146,13 @@ void Publish()
       // Prices are sent as the master saw them. The slave converts them
       // into distances from its own fill, so a broker quoting a few
       // cents away still gets the same stop in money terms.
-      body += StringFormat("POS,%I64u,%s,%d,%.2f,%s,%s,%s,%I64d,%I64d\n",
+      // Volume goes out at full precision. At %.2f a broker whose minimum
+      // lot is 0.001 publishes every position as 0.00 and nothing copies.
+      body += StringFormat("POS,%I64u,%s,%d,%s,%s,%s,%s,%I64d,%I64d\n",
                            position.Ticket(),
                            position.Symbol(),
                            (position.PositionType() == POSITION_TYPE_BUY ? 0 : 1),
-                           position.Volume(),
+                           DoubleToString(position.Volume(), 8),
                            DoubleToString(position.PriceOpen(), 8),
                            DoubleToString(position.StopLoss(),  8),
                            DoubleToString(position.TakeProfit(),8),
@@ -186,9 +188,9 @@ void Publish()
       double market    = isBuySide ? SymbolInfoDouble(sym, SYMBOL_ASK)
                                    : SymbolInfoDouble(sym, SYMBOL_BID);
 
-      body += StringFormat("ORD,%I64u,%s,%d,%.2f,%s,%s,%s,%I64d,%I64d,%s\n",
+      body += StringFormat("ORD,%I64u,%s,%d,%s,%s,%s,%s,%I64d,%I64d,%s\n",
                            ticket, sym, (int)type,
-                           OrderGetDouble(ORDER_VOLUME_CURRENT),
+                           DoubleToString(OrderGetDouble(ORDER_VOLUME_CURRENT), 8),
                            DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), 8),
                            DoubleToString(OrderGetDouble(ORDER_SL), 8),
                            DoubleToString(OrderGetDouble(ORDER_TP), 8),

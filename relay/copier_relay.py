@@ -138,7 +138,8 @@ button.danger{background:var(--bad)}
       <table>
         <thead><tr>
           <th>Account</th><th>Broker</th><th>State</th><th>Balance</th>
-          <th>Copies</th><th>Errors</th><th>Multiplier</th><th>Max lot</th><th></th>
+          <th>Copies</th><th>Last lot</th><th>Errors</th>
+          <th>Multiplier</th><th>Max lot</th><th></th>
         </tr></thead>
         <tbody id="slaves"></tbody>
       </table>
@@ -170,6 +171,16 @@ function gate(msg){
 
 function fmt(n, d=2){ return (n===undefined||n===null||n==="") ? "—" : Number(n).toFixed(d); }
 
+// Master lot beside the lot this slave actually got on. Matching numbers
+// are the quickest confirmation that sizing is doing what was asked; a
+// mismatch is flagged and the broker limit behind it sits in the tooltip.
+function lots(v){
+  const m = Number(v.lastmlot), s = Number(v.lastslot);
+  if(!s) return "—";
+  const same = Math.abs(m - s) < 0.005;
+  return `${m.toFixed(2)} → ${s.toFixed(2)}` + (same ? "" : " ⚠");
+}
+
 function render(s){
   $("#gate").classList.add("hidden");
   $("#app").classList.remove("hidden");
@@ -192,6 +203,7 @@ function render(s){
       <td><span class="pill ${cls}">${label}</span></td>
       <td>${fmt(v.balance)}</td>
       <td>${v.copies ?? "—"}</td>
+      <td class="${v.lotnote ? 'warn' : ''}" title="${v.lotnote || v.lotmode || ''}">${lots(v)}</td>
       <td class="${(v.errors|0)>0?'bad':''}">${v.errors ?? 0}</td>
       <td><input id="mul-${v.account}" value="${v.multiplier || ""}" placeholder="auto"></td>
       <td><input id="max-${v.account}" value="${v.maxlot || ""}" placeholder="none"></td>
@@ -323,6 +335,10 @@ class Handler(BaseHTTPRequestHandler):
                         "balance": s.get("balance", ""),
                         "copies": s.get("copies", ""),
                         "errors": s.get("errors", "0"),
+                        "lotmode": s.get("lotmode", ""),
+                        "lastmlot": s.get("lastmlot", ""),
+                        "lastslot": s.get("lastslot", ""),
+                        "lotnote": s.get("lotnote", ""),
                         "age": int(now - s.get("seen", 0)),
                         "paused": int(c["paused"]),
                         "multiplier": c["multiplier"] or "",

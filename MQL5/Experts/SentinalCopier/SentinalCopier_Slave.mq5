@@ -14,12 +14,16 @@
 //+------------------------------------------------------------------+
 //| Enums                                                            |
 //+------------------------------------------------------------------+
+// LOT_SAME is appended rather than inserted at the front: the value of an
+// enum member is its position, so putting it first would silently change
+// what every existing .set file means.
 enum ELotMode
   {
    LOT_BALANCE_RATIO,   // Scale by slave balance / master balance
    LOT_EQUITY_RATIO,    // Scale by slave equity / master equity
    LOT_MULTIPLIER,      // Master lot x fixed multiplier
-   LOT_FIXED            // Always the same lot
+   LOT_FIXED,           // Always the same lot
+   LOT_SAME             // Identical to the master, lot for lot
   };
 
 //+------------------------------------------------------------------+
@@ -48,13 +52,14 @@ input string   InpPanelUrl      = "";         // Panel URL; empty = use InpRelay
 input int      InpStatusMs      = 2000;       // How often to report (ms)
 
 input group "=== Sizing ==="
-input ELotMode InpLotMode       = LOT_BALANCE_RATIO; // How slave lots are derived
+input ELotMode InpLotMode       = LOT_SAME;   // How slave lots are derived
 input double   InpMultiplier    = 1.0;        // Multiplier (LOT_MULTIPLIER)
 input double   InpFixedLot      = 0.01;       // Fixed lot (LOT_FIXED)
 input double   InpMaxLot        = 0.0;        // Hard cap per trade; 0 = broker maximum
 
 input group "=== Behaviour ==="
 input bool     InpCopySLTP      = true;       // Copy stop loss and take profit
+input bool     InpCopyVolume    = true;       // Follow the master's partial closes and add-ons
 input bool     InpReverse       = false;      // Mirror inverted (buy becomes sell)
 input int      InpMaxPositions  = 50;         // Refuse to exceed this many copies
 input int      InpMaxSlippage   = 30;         // Max deviation (points)
@@ -119,6 +124,12 @@ int      g_cacheN = 0;
 // missing copy on the next pass and gets re-opened - forever, and faster
 // the lower the poll interval.
 ulong    g_seen[MAX_POS];
+// The master volume we have already matched for that ticket. Volume sync
+// works off the CHANGE in this number rather than off a comparison with
+// what we currently hold, which is what keeps the protection above intact:
+// our own stop closing part of a copy must never look like the master
+// adding to its position.
+double   g_seenVol[MAX_POS];
 int      g_seenN = 0;
 
 // Control from the web panel. These override the inputs while set, so a
@@ -134,6 +145,13 @@ datetime g_started  = 0;
 int      g_opened   = 0;
 int      g_closed   = 0;
 int      g_errors   = 0;
+int      g_resized  = 0;
+
+// Last sizing decision, for the panel: what the master traded, what we
+// actually got on, and why they differ when they do.
+double   g_lastMLot = 0.0;
+double   g_lastSLot = 0.0;
+string   g_lotNote  = "";
 
 const string PANEL_PREFIX = "SCS_";
 const string TAG          = "SC:";
@@ -333,7 +351,12 @@ void ReportStatus()
       "masterpos="  + IntegerToString(g_mCount + g_oCount)               + "\n" +
       "opened="     + IntegerToString(g_opened)                          + "\n" +
       "closed="     + IntegerToString(g_closed)                          + "\n" +
+      "resized="    + IntegerToString(g_resized)                         + "\n" +
       "errors="     + IntegerToString(g_errors)                          + "\n" +
+      "lotmode="    + EnumToString(InpLotMode)                           + "\n" +
+      "lastmlot="   + DoubleToString(g_lastMLot, 2)                      + "\n" +
+      "lastslot="   + DoubleToString(g_lastSLot, 2)                      + "\n" +
+      "lotnote="    + g_lotNote                                          + "\n" +
       "feed="       + g_feedNote                                         + "\n";
 
    char post[], reply[];
@@ -526,8 +549,180 @@ void Reconcile()
          OpenCopy(k);
         }
       else
+        {
+         // The master can change a live position two ways after entry: it
+         // can move the stops (a trailing EA, a manual drag, a break-even
+         // rule) and it can change the size (scaling out of a winner,
+         // adding to a runner). Both have to be followed or the copy drifts
+         // away from the master while still looking connected.
+         if(InpCopyVolume)
+            SyncVolume(k);
          if(InpCopySLTP)
-            SyncStops(slaveTicket, k);
+            SyncStopsAll(g_mTicket[k], k);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Follow the master's partial closes and add-ons.                  |
+//|                                                                  |
+//| Driven by the CHANGE in the master's volume since we last matched |
+//| it, never by comparing against what we currently hold. Our own    |
+//| stop taking out part of a copy would otherwise read as the master |
+//| having added, and we would pile back in against our own stop.     |
+//+------------------------------------------------------------------+
+void SyncVolume(const int k)
+  {
+   ulong  mt    = g_mTicket[k];
+   double lastM = HandledVolume(mt);
+
+   // The handled list lives in memory, so after a terminal restart a copy
+   // we still hold has no baseline. Adopt the master's size as it stands
+   // rather than giving up on it - seeding cannot trade, and without this
+   // volume sync stays dormant on that position for the rest of its life.
+   if(lastM < 0.0)
+     {
+      MarkHandled(mt, g_mVolume[k]);
+      return;
+     }
+
+   double nowM = g_mVolume[k];
+   string sym  = ResolveSymbol(g_mSymbol[k]);
+   if(sym == "")
+      return;
+
+   double step = LotStep(sym);
+   if(MathAbs(nowM - lastM) < step * 0.5)
+      return;                             // master size unchanged
+
+   if(nowM < lastM)
+     {
+      // Scaled out. Reduce to the new target, and only ever downward - if
+      // our own stop already took us below it, leave the remainder alone.
+      double target = SlaveLots(nowM, sym);
+      ReduceCopyTo(mt, sym, target);
+     }
+   else
+     {
+      // Added to. Put on the DIFFERENCE, not the new total, so a copy our
+      // stop has already trimmed is not quietly restored to full size.
+      double add = SlaveLots(nowM, sym) - SlaveLots(lastM, sym);
+      if(add >= step * 0.5)
+         IncreaseCopy(k, sym, add);
+     }
+
+   SetHandledVolume(mt, nowM);
+   g_lastMLot = nowM;
+   g_lastSLot = CopyVolume(mt);
+  }
+
+//+------------------------------------------------------------------+
+//| Close volume until this master ticket's copies total `target`.   |
+//| Hedging accounts can hold several positions for one master       |
+//| ticket, so this walks them smallest-first and closes whole ones   |
+//| where it can.                                                     |
+//+------------------------------------------------------------------+
+void ReduceCopyTo(const ulong masterTicket, const string sym, const double target)
+  {
+   double step   = LotStep(sym);
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+
+   double have = CopyVolume(masterTicket);
+   double drop = have - target;
+   if(drop < step * 0.5)
+      return;                             // already at or below the target
+
+   for(int i = PositionsTotal() - 1; i >= 0 && drop >= step * 0.5; i--)
+     {
+      if(!position.SelectByIndex(i))
+         continue;
+      if(position.Magic() != InpMagicNumber)
+         continue;
+      if(MasterTicketOf(position.Comment()) != masterTicket)
+         continue;
+
+      ulong  ticket = position.Ticket();
+      double vol    = position.Volume();
+
+      // Closing the whole thing is cleaner than leaving a stub the broker
+      // would reject anyway, so take it when the remainder cannot stand.
+      if(vol - drop < minLot - step * 0.5)
+        {
+         if(trade.PositionClose(ticket))
+           {
+            drop -= vol;
+            g_resized++;
+            PrintFormat("Copier: closed #%I64u in full following master #%I64u scaling out.",
+                        ticket, masterTicket);
+           }
+         else
+            g_errors++;
+        }
+      else
+        {
+         double cut = NormalizeDouble(MathRound(drop / step) * step,
+                                      (int)MathMax(0, MathRound(-MathLog10(step))));
+         if(cut < minLot)
+            cut = minLot;
+         if(trade.PositionClosePartial(ticket, cut))
+           {
+            drop -= cut;
+            g_resized++;
+            PrintFormat("Copier: reduced #%I64u by %.2f following master #%I64u.",
+                        ticket, cut, masterTicket);
+           }
+         else
+           {
+            g_errors++;
+            PrintFormat("Copier: partial close failed on #%I64u. retcode=%d (%s)",
+                        ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Add to this master ticket's copy.                                |
+//|                                                                  |
+//| On a netting account the broker merges this into the existing     |
+//| position; on a hedging account it becomes a second position       |
+//| carrying the same master tag, which every lookup here treats as   |
+//| part of the same copy.                                            |
+//+------------------------------------------------------------------+
+void IncreaseCopy(const int k, const string sym, const double addLots)
+  {
+   double lots = ClampLots(addLots, sym);
+   if(lots <= 0.0)
+      return;
+
+   bool masterBuy = (g_mType[k] == 0);
+   bool buy       = (InpReverse ? !masterBuy : masterBuy);
+
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   if(ask <= 0.0 || bid <= 0.0)
+     { g_errors++; return; }
+   double price = buy ? ask : bid;
+
+   double sl = 0.0, tp = 0.0;
+   if(InpCopySLTP)
+      StopsFor(k, sym, price, buy, sl, tp);
+
+   string comment = TAG + IntegerToString((long)g_mTicket[k]);
+
+   bool ok = buy ? trade.Buy(lots, sym, 0.0, sl, tp, comment)
+                 : trade.Sell(lots, sym, 0.0, sl, tp, comment);
+   if(ok)
+     {
+      g_resized++;
+      PrintFormat("Copier: added %.2f %s following master #%I64u scaling in.",
+                  lots, sym, g_mTicket[k]);
+     }
+   else
+     {
+      g_errors++;
+      PrintFormat("Copier: add-on failed for %s. retcode=%d (%s)",
+                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
      }
   }
 
@@ -649,7 +844,7 @@ void PlacePending(const int k)
    if(ok)
      {
       g_opened++;
-      MarkHandled(g_oTicket[k]);
+      MarkHandled(g_oTicket[k], g_oVolume[k]);
       PrintFormat("Copier: pending %s %.2f %s @ %s copying master #%I64u.",
                   EnumToString((ENUM_ORDER_TYPE)type), lots, sym,
                   DoubleToString(price, digits), g_oTicket[k]);
@@ -710,7 +905,9 @@ void OpenCopy(const int k)
    if(ok)
      {
       g_opened++;
-      MarkHandled(g_mTicket[k]);
+      MarkHandled(g_mTicket[k], g_mVolume[k]);
+      g_lastMLot = g_mVolume[k];
+      g_lastSLot = lots;
       PrintFormat("Copier: %s %.2f %s copying master #%I64u (master %.2f lots).",
                   (buy ? "BUY" : "SELL"), lots, sym, g_mTicket[k], g_mVolume[k]);
      }
@@ -766,6 +963,43 @@ void StopsFor(const int k, const string sym, const double price,
   }
 
 //+------------------------------------------------------------------+
+//| Keep every position belonging to one master ticket in step.      |
+//|                                                                  |
+//| A hedging account can hold more than one position for the same    |
+//| master trade once the master has scaled in, and a trailing stop   |
+//| has to reach all of them, not just the first one found.           |
+//+------------------------------------------------------------------+
+void SyncStopsAll(const ulong masterTicket, const int k)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!position.SelectByIndex(i))
+         continue;
+      if(position.Magic() != InpMagicNumber)
+         continue;
+      if(MasterTicketOf(position.Comment()) != masterTicket)
+         continue;
+      SyncStops(position.Ticket(), k);
+     }
+  }
+
+// Everything we hold for one master ticket, added up.
+double CopyVolume(const ulong masterTicket)
+  {
+   double v = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!position.SelectByIndex(i))
+         continue;
+      if(position.Magic() != InpMagicNumber)
+         continue;
+      if(MasterTicketOf(position.Comment()) == masterTicket)
+         v += position.Volume();
+     }
+   return(v);
+  }
+
+//+------------------------------------------------------------------+
 //| Keep an open copy's stops in step with the master                |
 //+------------------------------------------------------------------+
 void SyncStops(const ulong slaveTicket, const int k)
@@ -805,6 +1039,9 @@ double SlaveLots(const double masterLots, const string sym)
 
    switch(InpLotMode)
      {
+      case LOT_SAME:
+         lots = masterLots;               // lot for lot, whatever the balances
+         break;
       case LOT_FIXED:
          lots = InpFixedLot;
          break;
@@ -829,6 +1066,8 @@ double SlaveLots(const double masterLots, const string sym)
 //+------------------------------------------------------------------+
 double ClampLots(double lots, const string sym)
   {
+   double wanted = lots;
+
    // The panel's cap wins when it is set, otherwise the input applies.
    double cap = (g_ctlMaxLot > 0.0) ? g_ctlMaxLot : InpMaxLot;
    if(cap > 0.0 && lots > cap)
@@ -840,14 +1079,44 @@ double ClampLots(double lots, const string sym)
    if(step <= 0.0)
       step = 0.01;
 
-   lots = MathFloor(lots / step) * step;
+   // Round to the NEAREST step, not down. Flooring turned a requested 0.10
+   // into 0.09 wherever the step did not divide it exactly, so "the same as
+   // the master" quietly came out smaller every time.
+   lots = MathRound(lots / step) * step;
    if(lots < minLot)
       lots = minLot;                      // the broker cannot trade smaller
    if(lots > maxLot)
       lots = maxLot;
 
    int lotDigits = (int)MathMax(0, MathRound(-MathLog10(step)));
-   return(NormalizeDouble(lots, lotDigits));
+   lots = NormalizeDouble(lots, lotDigits);
+
+   // Say so when this broker would not give us the size we asked for. It
+   // is the difference between a copier that is working and one that is
+   // silently trading a different size from the master.
+   if(MathAbs(lots - wanted) > step * 0.5)
+     {
+      if(wanted < minLot)
+         g_lotNote = StringFormat("broker min %.*f", lotDigits, minLot);
+      else if(wanted > maxLot)
+         g_lotNote = StringFormat("broker max %.*f", lotDigits, maxLot);
+      else if(cap > 0.0 && MathAbs(lots - cap) <= step * 0.5)
+         g_lotNote = StringFormat("capped at %.*f", lotDigits, cap);
+      else
+         g_lotNote = StringFormat("step %.*f", lotDigits, step);
+     }
+   else
+      g_lotNote = "";
+
+   return(lots);
+  }
+
+// Smallest volume change this symbol can express, used to decide whether a
+// difference is real or just floating-point noise.
+double LotStep(const string sym)
+  {
+   double step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   return(step > 0.0 ? step : 0.01);
   }
 
 //+------------------------------------------------------------------+
@@ -886,21 +1155,45 @@ string ResolveSymbol(const string masterSym)
          if(SymbolInfoDouble(masterSym, SYMBOL_BID) > 0.0)
             found = masterSym;
 
-   // 3. canonical-base match across everything the broker offers
+   // 3. canonical-base match across everything the broker offers.
+   //    Brokers list several variants of one instrument - XAUUSD alongside
+   //    XAUUSD.raw, or a disabled leftover from an old account type - so
+   //    take the first TRADABLE match rather than the first match, and
+   //    only fall back to a non-tradable one if nothing better exists.
    if(found == "")
      {
-      string want = CanonicalBase(masterSym);
+      string want     = CanonicalBase(masterSym);
+      string fallback = "";
       int total = SymbolsTotal(false);
       for(int i = 0; i < total && found == ""; i++)
         {
          string cand = SymbolName(i, false);
-         if(CanonicalBase(cand) == want)
+         if(CanonicalBase(cand) != want)
+            continue;
+
+         SymbolSelect(cand, true);
+         long mode = SymbolInfoInteger(cand, SYMBOL_TRADE_MODE);
+         if(mode == SYMBOL_TRADE_MODE_FULL || mode == SYMBOL_TRADE_MODE_LONGONLY ||
+            mode == SYMBOL_TRADE_MODE_SHORTONLY)
             found = cand;
+         else
+            if(fallback == "")
+               fallback = cand;
+        }
+      if(found == "" && fallback != "")
+        {
+         found = fallback;
+         PrintFormat("Copier: '%s' matched '%s', but this broker has it "
+                     "close-only or disabled.", masterSym, found);
         }
      }
 
    if(found != "")
       SymbolSelect(found, true);
+   else
+      PrintFormat("Copier: nothing on this broker matches '%s' (looked for base "
+                  "'%s'). Set InpSymbolMap, e.g. \"%s=<local name>\".",
+                  masterSym, CanonicalBase(masterSym), masterSym);
 
    if(g_cacheN < 64)
      {
@@ -925,56 +1218,119 @@ string CanonicalBase(const string s)
    string b = SymbolBase(s);
 
    // Metals
-   if(b == "GOLD" || b == "GOLDSPOT" || b == "XAUUSD")            return("XAUUSD");
-   if(b == "SILVER" || b == "SILVERSPOT" || b == "XAGUSD")        return("XAGUSD");
+   if(b == "GOLD" || b == "GOLDSPOT" || b == "XAUUSD" || b == "GOLDUSD")   return("XAUUSD");
+   if(b == "SILVER" || b == "SILVERSPOT" || b == "XAGUSD" ||
+      b == "SILVERUSD")                                                    return("XAGUSD");
+   if(b == "XPTUSD" || b == "PLATINUM")                                    return("XPTUSD");
+   if(b == "XPDUSD" || b == "PALLADIUM")                                   return("XPDUSD");
 
    // Indices
    if(b == "US30" || b == "DJ30" || b == "DOW" || b == "DOW30" ||
-      b == "WS30" || b == "USA30")                                return("US30");
+      b == "WS30" || b == "USA30" || b == "DJIA" || b == "US30CASH" ||
+      b == "YM")                                                  return("US30");
    if(b == "NAS100" || b == "USTEC" || b == "NDX100" || b == "US100" ||
-      b == "USATEC" || b == "NASDAQ")                             return("NAS100");
-   if(b == "SPX500" || b == "US500" || b == "SP500" || b == "USA500") return("SPX500");
+      b == "USATEC" || b == "NASDAQ" || b == "NDX" || b == "NQ" ||
+      b == "TECH100")                                             return("NAS100");
+   if(b == "SPX500" || b == "US500" || b == "SP500" || b == "USA500" ||
+      b == "SPX" || b == "ES" || b == "SPXUSD")                    return("SPX500");
    if(b == "GER40" || b == "DAX40" || b == "DE40" || b == "GER30" ||
-      b == "DAX30" || b == "DE30")                                return("GER40");
-   if(b == "UK100" || b == "FTSE100" || b == "GB100")             return("UK100");
-   if(b == "JP225" || b == "NIKKEI" || b == "JPN225")             return("JP225");
+      b == "DAX30" || b == "DE30" || b == "DAX" || b == "GERMANY40") return("GER40");
+   if(b == "UK100" || b == "FTSE100" || b == "GB100" || b == "FTSE" ||
+      b == "UKX")                                                 return("UK100");
+   if(b == "JP225" || b == "NIKKEI" || b == "JPN225" || b == "NI225" ||
+      b == "JAPAN225")                                            return("JP225");
+   if(b == "FRA40" || b == "CAC40" || b == "FR40" || b == "FRANCE40") return("FRA40");
+   if(b == "AUS200" || b == "ASX200" || b == "AU200")             return("AUS200");
+   if(b == "EU50" || b == "STOXX50" || b == "ESTX50" || b == "EUSTX50") return("EU50");
+   if(b == "HK50" || b == "HSI" || b == "HANGSENG")               return("HK50");
+   if(b == "US2000" || b == "RUSSELL2000" || b == "RUT")          return("US2000");
 
    // Energy
    if(b == "USOIL" || b == "WTI" || b == "CRUDE" || b == "XTIUSD" ||
-      b == "OILUSD" || b == "CL")                                 return("USOIL");
-   if(b == "UKOIL" || b == "BRENT" || b == "XBRUSD")              return("UKOIL");
+      b == "OILUSD" || b == "CL" || b == "CRUDEOIL" ||
+      b == "WTIUSD" || b == "USCRUDE")                            return("USOIL");
+   if(b == "UKOIL" || b == "BRENT" || b == "XBRUSD" || b == "BRENTUSD" ||
+      b == "UKBRENT")                                             return("UKOIL");
+   if(b == "NATGAS" || b == "XNGUSD" || b == "NGAS" || b == "NG")  return("NATGAS");
 
    // Crypto
-   if(b == "BTCUSD" || b == "BITCOIN")                            return("BTCUSD");
-   if(b == "ETHUSD" || b == "ETHEREUM")                           return("ETHUSD");
+   if(b == "BTCUSD" || b == "BITCOIN" || b == "BTCUSDT" || b == "XBTUSD") return("BTCUSD");
+   if(b == "ETHUSD" || b == "ETHEREUM" || b == "ETHUSDT")         return("ETHUSD");
+   if(b == "LTCUSD" || b == "LITECOIN" || b == "LTCUSDT")         return("LTCUSD");
+   if(b == "XRPUSD" || b == "RIPPLE" || b == "XRPUSDT")           return("XRPUSD");
 
    return(b);
   }
 
-// "XAUUSD.m" -> "XAUUSD", "XAUUSDm" -> "XAUUSD", "EURUSD_i" -> "EURUSD"
+// Strip a broker's decoration to get at the instrument underneath:
+//   "XAUUSD.m" "XAUUSDm" "EURUSD_i" "EURUSD-5" -> suffixes
+//   "FX_EURUSD" "#AAPL" "m.XAUUSD"             -> prefixes
+//   "US30.cash"                                -> keeps US30
 string SymbolBase(const string s)
   {
    string t = s;
 
-   int cut = -1;
-   for(int i = 0; i < StringLen(t); i++)
+   // Split on the separators brokers decorate with and take the first
+   // segment that is long enough to be an instrument. Taking the first
+   // segment unconditionally turned "FX_EURUSD" into "FX"; taking the
+   // longest turns "US30.cash" into "cash". Neither is the instrument.
+   string parts[];
+   int n = 0;
+   StringReplace(t, ".", "|");
+   StringReplace(t, "_", "|");
+   StringReplace(t, "-", "|");
+   StringReplace(t, "#", "|");
+   StringReplace(t, "/", "|");
+   n = StringSplit(t, '|', parts);
+   if(n > 0)
      {
-      ushort c = StringGetCharacter(t, i);
-      if(c == '.' || c == '_' || c == '-' || c == '#')
-        { cut = i; break; }
+      t = "";
+      for(int i = 0; i < n && t == ""; i++)
+         if(StringLen(parts[i]) >= 3)
+            t = parts[i];
+      if(t == "")
+         t = parts[0];
      }
-   if(cut >= 0)
-      t = StringSubstr(t, 0, cut);
 
-   // Trailing lower-case decoration such as the "m" in XAUUSDm.
-   while(StringLen(t) > 3)
+   // Leading lower-case decoration: the "m" in mXAUUSD. Only when what is
+   // left still looks like an instrument.
+   int lead = 0;
+   while(lead < StringLen(t))
      {
-      ushort c = StringGetCharacter(t, StringLen(t) - 1);
-      if(c >= 'a' && c <= 'z')
-         t = StringSubstr(t, 0, StringLen(t) - 1);
-      else
-         break;
+      ushort c = StringGetCharacter(t, lead);
+      if(c >= 'a' && c <= 'z') lead++;
+      else break;
      }
+   if(lead > 0 && StringLen(t) - lead >= 4)
+      t = StringSubstr(t, lead);
+
+   // Trailing lower-case decoration: the "m" in XAUUSDm, the "pro" in
+   // EURUSDpro. Naively stripping every trailing lower-case letter also
+   // eats real names - "Gold" becomes "GOL", "Silver" becomes "SILV" - so
+   // instead take the leading run of upper case and digits and keep it
+   // only if that run is itself long enough to be the instrument. A name
+   // that is merely capitalised has a run of one and is left alone.
+   int core = 0;
+   while(core < StringLen(t))
+     {
+      ushort c = StringGetCharacter(t, core);
+      if(!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
+         break;
+      // A capitalised word starting straight after a digit is decoration,
+      // not instrument: US30Cash is US30. The digit is what distinguishes
+      // it from the D in XAUUSDm, where the letter really is part of the
+      // name and only the trailing "m" is the broker's.
+      if(c >= 'A' && c <= 'Z' && core > 0 && core + 1 < StringLen(t))
+        {
+         ushort prv = StringGetCharacter(t, core - 1);
+         ushort nxt = StringGetCharacter(t, core + 1);
+         if(prv >= '0' && prv <= '9' && nxt >= 'a' && nxt <= 'z')
+            break;
+        }
+      core++;
+     }
+   if(core >= 4 && core < StringLen(t))
+      t = StringSubstr(t, 0, core);
 
    StringToUpper(t);
    return(t);
@@ -999,10 +1355,31 @@ bool AlreadyHandled(const ulong t)
    return(false);
   }
 
-void MarkHandled(const ulong t)
+void MarkHandled(const ulong t, const double masterVol)
   {
    if(!AlreadyHandled(t) && g_seenN < MAX_POS)
-      g_seen[g_seenN++] = t;
+     {
+      g_seen[g_seenN]    = t;
+      g_seenVol[g_seenN] = masterVol;
+      g_seenN++;
+     }
+  }
+
+// The master volume we last matched for this ticket, or -1 if we have not
+// acted on it at all. Volume sync uses the difference against this.
+double HandledVolume(const ulong t)
+  {
+   for(int i = 0; i < g_seenN; i++)
+      if(g_seen[i] == t)
+         return(g_seenVol[i]);
+   return(-1.0);
+  }
+
+void SetHandledVolume(const ulong t, const double masterVol)
+  {
+   for(int i = 0; i < g_seenN; i++)
+      if(g_seen[i] == t)
+        { g_seenVol[i] = masterVol; return; }
   }
 
 // Once the master's own position is gone the ticket can never come back,
@@ -1012,7 +1389,11 @@ void ForgetClosedMasters()
    int w = 0;
    for(int i = 0; i < g_seenN; i++)
       if(FindMaster(g_seen[i]) >= 0 || FindMasterOrder(g_seen[i]) >= 0)
-         g_seen[w++] = g_seen[i];
+        {
+         g_seen[w]    = g_seen[i];
+         g_seenVol[w] = g_seenVol[i];
+         w++;
+        }
    g_seenN = w;
   }
 
@@ -1148,16 +1529,30 @@ void PanelUpdate()
    PanelLine(row++, "This bal",   clrWhite,
              DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + " " +
              AccountInfoString(ACCOUNT_CURRENCY));
-   PanelLine(row++, "Ratio",   clrWhite,
-             (g_mBalance > 0.0
-              ? StringFormat("x%.3f  (%s)", AccountInfoDouble(ACCOUNT_BALANCE) / g_mBalance,
-                             EnumToString(InpLotMode))
-              : EnumToString(InpLotMode)));
+   PanelLine(row++, "Sizing",  clrWhite,
+             (InpLotMode == LOT_SAME
+              ? "LOT_SAME - lot for lot"
+              : (g_mBalance > 0.0
+                 ? StringFormat("%s  x%.3f", EnumToString(InpLotMode),
+                                AccountInfoDouble(ACCOUNT_BALANCE) / g_mBalance)
+                 : EnumToString(InpLotMode))));
+
+   // Master lot against what we actually got on. Equal numbers here is the
+   // quickest confirmation that sizing is doing what you asked; a note
+   // beside them says which broker limit moved it when they are not.
+   if(g_lastSLot > 0.0)
+      PanelLine(row++, "Last lot",
+                (g_lotNote == "" ? clrWhite : clrGold),
+                StringFormat("master %.2f  ->  this %.2f%s",
+                             g_lastMLot, g_lastSLot,
+                             (g_lotNote == "" ? "" : "   (" + g_lotNote + ")")));
+
    PanelLine(row++, "Master pos", clrWhite, IntegerToString(g_mCount));
    PanelLine(row++, "Copies",  clrWhite,
              IntegerToString(CountCopies()) + " / " + IntegerToString(InpMaxPositions));
    PanelLine(row++, "Session", clrWhite,
-             StringFormat("opened %d  closed %d  errors %d", g_opened, g_closed, g_errors));
+             StringFormat("opened %d  closed %d  resized %d  errors %d",
+                          g_opened, g_closed, g_resized, g_errors));
    if(InpReverse)
       PanelLine(row++, "Mode", clrGold, "REVERSED - buys copy as sells");
 

@@ -108,16 +108,45 @@ master's login, its broker, and the live lot ratio.
 
 | Mode | Behaviour |
 |---|---|
-| `LOT_BALANCE_RATIO` *(default)* | slave balance ÷ master balance × master lot |
+| `LOT_SAME` *(default)* | identical to the master, lot for lot |
+| `LOT_BALANCE_RATIO` | slave balance ÷ master balance × master lot |
 | `LOT_EQUITY_RATIO` | same, on equity |
 | `LOT_MULTIPLIER` | master lot × `InpMultiplier` |
 | `LOT_FIXED` | always `InpFixedLot` |
 
-Every result is clamped to the slave broker's own min, max and step. On a small
-slave account the broker minimum is a floor — a $100 account following a $10,000
-master will trade 0.01 lots where the ratio asks for 0.001, which is
-proportionally **ten times** the master's risk. `InpMaxLot` caps the other
-direction.
+Every result is clamped to the slave broker's own min, max and step, and rounded
+to the **nearest** step rather than down — flooring quietly turned a requested
+0.10 into 0.09 wherever the step did not divide it exactly.
+
+The slave panel shows `master 0.10 -> this 0.10` for the last trade sized. Equal
+numbers are the quickest confirmation that sizing is doing what you asked; when
+they differ the row turns gold and names the broker limit responsible.
+
+`LOT_SAME` copies risk in *lots*, not in proportion. On a smaller slave account
+that is proportionally larger risk than the master is taking — which is usually
+the point of asking for it, but it is worth saying plainly. The ratio modes exist
+for the other intent. Either way the broker minimum is a hard floor: a $100
+account following a $10,000 master trades 0.01 where the ratio asks for 0.001.
+`InpMaxLot` caps the other direction.
+
+## Partial closes and add-ons
+
+`InpCopyVolume` *(default on)* follows the master's size changes after entry.
+Scale out of half a position on the master and the slave closes the same
+proportion; add to a runner and the slave adds too.
+
+This is driven by the **change** in the master's volume since the slave last
+matched it, never by comparing against what the slave currently holds. That
+distinction is what keeps the re-entry protection intact: a copy that the slave's
+own stop has partly closed must never read as the master having added, or the EA
+would pile back in against its own stop. Concretely — if your stop takes 0.06 off
+a 0.10 copy and the master then goes from 0.10 to 0.15, the slave adds 0.05, not
+0.11.
+
+Reductions only ever close and additions only ever open, so neither direction can
+undo what a stop already did. On a hedging account an add-on becomes a second
+position carrying the same master tag; every lookup treats the group as one copy,
+and trailing stops are applied to all of them.
 
 ## Pending orders
 
@@ -144,21 +173,36 @@ entry.
 
 `SyncStops` compares the master's current stop distance against the copy's and
 modifies when they differ by more than 5 points, so a trailing stop follows
-continuously without spamming the broker with identical modifications.
+continuously without spamming the broker with identical modifications. It is
+applied to **every** position belonging to a master trade, so a trailing stop
+still reaches a copy the master has scaled into more than once.
 
 ## Symbols
 
-Resolution runs in three steps: an explicit `InpSymbolMap` entry, then the exact
-name, then a base-name match against everything the broker lists.
+Any broker on either side. Resolution runs in three steps: an explicit
+`InpSymbolMap` entry, then the exact name, then a base-name match against
+everything the broker lists.
 
-Base matching strips decoration, so `XAUUSD` finds `XAUUSD.m`, `XAUUSDm`,
-`XAUUSD_i` or `XAUUSD#` by itself. Brokers also rename instruments outright, so
-an alias table folds the common ones together: `GOLD`/`XAUUSD`,
-`SILVER`/`XAGUSD`, `US30`/`DJ30`/`WS30`, `NAS100`/`USTEC`/`US100`,
-`SPX500`/`US500`, `GER40`/`DAX40`, `USOIL`/`WTI`, `UKOIL`/`BRENT`,
-`BTCUSD`/`BITCOIN`. That is what lets an FxPro master trading `GOLD` feed an
-Exness slave trading `XAUUSDm`. When it cannot, the log names the symbol it
-could not place and `InpSymbolMap` takes overrides:
+Base matching strips decoration from **both ends**, so `XAUUSD` finds
+`XAUUSD.m`, `XAUUSDm`, `XAUUSD_i`, `XAUUSD#`, `XAUUSD.raw`, `XAUUSD-5`,
+`XAUUSDmicro` and `mXAUUSD` by itself, and `FX_EURUSD` resolves to `EURUSD`
+rather than to `FX`. It leaves real names alone: a broker listing `Gold` or
+`Silver` keeps them whole instead of being cut to `GOL` and `SILV`, and
+`US30Cash` reduces to `US30` while `XAUUSDm` keeps its `D`.
+
+Brokers also rename instruments outright, so an alias table folds the common ones
+together — gold, silver, platinum, palladium, the major indices
+(`US30`/`DJ30`/`WS30`/`DJIA`, `NAS100`/`USTEC`/`US100`, `SPX500`/`US500`,
+`GER40`/`DAX40`, `UK100`/`FTSE`, `JP225`/`NIKKEI`, `FRA40`, `AUS200`, `EU50`,
+`HK50`, `US2000`), energy (`USOIL`/`WTI`/`CRUDE`, `UKOIL`/`BRENT`, `NATGAS`) and
+crypto (`BTCUSD`/`BITCOIN`/`XBTUSD`, `ETHUSD`, `LTCUSD`, `XRPUSD`). That is what
+lets an FxPro master trading `GOLD` feed a slave trading `XAUUSDm` — or
+`XAUUSD.m`, or `Gold`, at any broker.
+
+Where a broker lists several variants of one instrument, the first **tradable**
+one wins; a close-only or disabled leftover is used only if nothing better
+exists, and the log says so. When resolution fails entirely the log names the
+symbol, the base it looked for, and the `InpSymbolMap` line that would fix it:
 
 ```
 XAUUSD=XAUUSD.m,US30=US30.cash
