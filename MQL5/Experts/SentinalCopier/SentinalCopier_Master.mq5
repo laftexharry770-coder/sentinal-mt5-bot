@@ -74,9 +74,15 @@ int OnInit()
    EventSetMillisecondTimer(InpPublishMs);
    Publish();
 
-   PrintFormat("Copier master on account %I64d (%s). Channel '%s' -> Common\\Files\\%s",
-               AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_COMPANY),
-               ch, g_file);
+   PrintFormat("Copier master on account %I64d (%s). Channel '%s'.",
+               AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_COMPANY), ch);
+
+   // Print the absolute path. A slave that reports "no feed file" while
+   // this master says it is publishing means the two terminals do not
+   // share a Common folder - which happens when either was started with
+   // /portable. Comparing these two lines settles it immediately.
+   PrintFormat("Copier master WRITING TO: %s\\Files\\%s",
+               TerminalInfoString(TERMINAL_COMMONDATA_PATH), g_file);
    return(INIT_SUCCEEDED);
   }
 

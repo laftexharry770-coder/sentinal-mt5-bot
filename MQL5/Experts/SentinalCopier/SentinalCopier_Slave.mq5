@@ -122,8 +122,15 @@ int OnInit()
 
    EventSetMillisecondTimer(InpPollMs);
 
-   PrintFormat("Copier slave on account %I64d (%s). Reading Common\\Files\\%s",
-               AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_COMPANY), g_file);
+   PrintFormat("Copier slave on account %I64d (%s). Channel '%s'.",
+               AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_COMPANY), ch);
+
+   // Print the absolute path so it can be compared with the master's.
+   // Identical paths and still no file means the master is not running;
+   // different paths mean the terminals do not share a Common folder,
+   // which is what /portable does.
+   PrintFormat("Copier slave READING FROM: %s\\Files\\%s",
+               TerminalInfoString(TERMINAL_COMMONDATA_PATH), g_file);
    return(INIT_SUCCEEDED);
   }
 
