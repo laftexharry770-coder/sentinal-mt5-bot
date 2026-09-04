@@ -38,6 +38,35 @@ The relay holds only the newest snapshot per channel, in memory. It never sees a
 account password and cannot place a trade. Put it behind TLS if it faces the
 open internet - the shared key is the only thing protecting the feed.
 
+### Which launcher to run
+
+| Where the terminals are | Run | Address the EAs use |
+|---|---|---|
+| All on one PC or VPS | nothing - use `TRANSPORT_FILE` | shared Common folder |
+| Different PCs, **same** network | `relay/START_RELAY.bat` | `http://<LAN IP>:8787` |
+| Different PCs, **different** networks | `relay/START_PUBLIC.bat` | `https://<name>.trycloudflare.com` |
+
+A LAN address is only reachable from the same network, so when the master and the
+slaves are in different buildings the middle row cannot work no matter how the
+EAs are configured.
+
+`START_PUBLIC.bat` starts the relay and puts a **Cloudflare quick tunnel** in
+front of it, giving a public HTTPS address with no account, no router changes and
+no port forwarding. It needs `cloudflared.exe` - one file from
+[the releases page](https://github.com/cloudflare/cloudflared/releases/latest),
+renamed and dropped in the `relay/` folder - and it prints the exact
+`InpRelayUrl` and `InpRelayKey` to paste into every terminal.
+
+It verifies the tunnel actually answers before printing it, so an address it
+shows you is one that works.
+
+**A quick tunnel gets a new address every restart**, and MT5 only permits URLs
+you have whitelisted, so every restart means re-whitelisting in every terminal.
+That is fine for testing and tiresome as a routine. For anything you intend to
+leave running, put `copier_relay.py` on a small VPS with a fixed address and
+whitelist that once - the relay is one file with no dependencies and runs on the
+cheapest box available.
+
 ## Latency
 
 - The master publishes **the instant a trade event fires** (`OnTradeTransaction`),

@@ -1,1 +1,4 @@
 relay_key.txt
+cloudflared
+cloudflared.exe
+__pycache__/
