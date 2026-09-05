@@ -67,6 +67,38 @@ leave running, put `copier_relay.py` on a small VPS with a fixed address and
 whitelist that once - the relay is one file with no dependencies and runs on the
 cheapest box available.
 
+## Slaves in different places
+
+Any number of slaves, anywhere, follow one master over `TRANSPORT_HTTP`. They do
+not need to be near the master, on the same network, or in the same country —
+each one just needs to reach the relay URL. Set the same `InpChannel`,
+`InpRelayUrl` and `InpRelayKey` on every slave and whitelist the URL in each
+terminal; the relay keeps them apart by account number on the panel.
+
+Two things behave differently once a slave is out on the internet rather than on
+a LAN.
+
+**The round trip sets the pace, not `InpPollMs`.** A slave 200 ms from the relay
+learns about a trade in 200 ms no matter how often it asks, so polling every
+100 ms just triples the requests for nothing. The slave panel shows
+`Relay: round trip 180 ms (polling every 100 ms)` and the web panel has a `Link`
+column; set `InpPollMs` to roughly the round trip and leave it there. Anything
+under about 250 ms is fine for copying — the brokers' own execution is larger
+than that.
+
+**A dead link must not stall the copier.** MT5's `WebRequest` is synchronous: it
+blocks the EA until the reply arrives or `InpHttpTimeoutMs` expires. Left
+unchecked, a slave on a dropped connection spends its entire life blocked and
+stops reconciling — which means it stops processing the master's **closes** too,
+the one thing you cannot afford to miss. So a failed request backs off, doubling
+from 1 s to a 30 s ceiling and resetting the moment the relay answers. The feed
+and the status report back off independently, so an unreachable panel never
+costs the feed a timeout.
+
+While backed off the slave **holds**: it keeps its positions and their stops and
+copies nothing new. That is the safe failure — a silent relay is not evidence
+that the master closed anything.
+
 ## Latency
 
 - The master publishes **the instant a trade event fires** (`OnTradeTransaction`),

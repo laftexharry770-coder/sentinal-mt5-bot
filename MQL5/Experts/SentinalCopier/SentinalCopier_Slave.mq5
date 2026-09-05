@@ -158,6 +158,30 @@ int      g_adjusted = 0;         // stops this broker would not take as given
 bool     g_clamped  = false;     // the last StopsFor had to move a level
 string   g_stopNote = "";
 
+// Relay health. WebRequest is SYNCHRONOUS: it blocks the EA until the
+// reply or the timeout. Over the internet a dead relay would therefore
+// cost InpHttpTimeoutMs on every single cycle, and a slave that spends
+// its life blocked stops reconciling - so it would not process the
+// master's CLOSES either. Back off instead of hammering, and reset the
+// moment it answers again.
+uint     g_relayNextTry = 0;     // GetTickCount() before which we do not ask
+int      g_relayFails   = 0;
+uint     g_relayRttMs   = 0;     // last successful round trip
+uint     g_panelNextTry = 0;     // the status POST backs off separately, so a
+int      g_panelFails   = 0;     // dead panel never stalls the feed
+
+#define RELAY_BACKOFF_BASE_MS  1000
+#define RELAY_BACKOFF_MAX_MS  30000
+
+// Doubling delay, capped. Returns ms to wait after `fails` failures.
+uint BackoffMs(const int fails)
+  {
+   uint ms = RELAY_BACKOFF_BASE_MS;
+   for(int i = 1; i < fails && ms < RELAY_BACKOFF_MAX_MS; i++)
+      ms *= 2;
+   return(ms > RELAY_BACKOFF_MAX_MS ? RELAY_BACKOFF_MAX_MS : ms);
+  }
+
 // Operations the broker has just refused. A rejection repeats on the next
 // cycle and every cycle after it, so without a back-off one bad stop
 // becomes ten errors a second and a log nobody can read.
@@ -380,7 +404,20 @@ void ReportStatus()
       "adjusted="   + IntegerToString(g_adjusted)                        + "\n" +
       "stopnote="   + g_stopNote                                         + "\n" +
       "entryoff="   + DoubleToString(g_lastSlip, 0)                      + "\n" +
+      "rtt="        + IntegerToString((int)g_relayRttMs)                 + "\n" +
       "feed="       + g_feedNote                                         + "\n";
+
+   // Backed off separately from the feed: reporting status is a
+   // convenience, copying is not, and an unreachable panel must never
+   // cost the feed a timeout on every cycle.
+   uint now = GetTickCount();
+   if(g_panelFails > 0 && now < g_panelNextTry)
+     {
+      g_panelOk   = false;
+      g_panelNote = StringFormat("panel down, retrying in %d s",
+                                 (int)((g_panelNextTry - now) / 1000) + 1);
+      return;
+     }
 
    char post[], reply[];
    string replyHeaders;
@@ -397,15 +434,20 @@ void ReportStatus()
    if(code != 200)
      {
       g_panelOk = false;
+      g_panelFails++;
+      g_panelNextTry = GetTickCount() + BackoffMs(g_panelFails);
+
       int err = GetLastError();
       g_panelNote = (code == -1 && err == 4014)
                     ? "panel URL not whitelisted"
-                    : StringFormat("panel HTTP %d", code);
+                    : (code == 401 ? "panel rejected the key"
+                                   : StringFormat("panel HTTP %d", code));
       return;
      }
 
-   g_panelOk   = true;
-   g_panelNote = "connected";
+   g_panelFails = 0;
+   g_panelOk    = true;
+   g_panelNote  = "connected";
    ApplyControl(CharArrayToString(reply, 0, ArraySize(reply), CP_UTF8));
   }
 
@@ -480,25 +522,62 @@ string FetchFromRelay()
       url = StringSubstr(url, 0, StringLen(url) - 1);
    url += "/feed?channel=" + Trim(InpChannel);
 
+   // Still inside the back-off window from a previous failure. Say so and
+   // return without blocking - holding on a stale feed is safe, spending
+   // two seconds per cycle waiting on a dead relay is not.
+   uint now = GetTickCount();
+   if(g_relayFails > 0 && now < g_relayNextTry)
+     {
+      g_feedNote = StringFormat("relay down, retrying in %d s",
+                                (int)((g_relayNextTry - now) / 1000) + 1);
+      return("");
+     }
+
    char post[], reply[];
    string replyHeaders;
    string headers = "X-Copier-Key: " + Trim(InpRelayKey) + "\r\n";
 
    ResetLastError();
+   uint sent = GetTickCount();
    int code = WebRequest("GET", url, headers, InpHttpTimeoutMs, post, reply, replyHeaders);
+   uint rtt  = GetTickCount() - sent;
 
-   if(code == -1)
+   if(code != 200)
      {
-      int err = GetLastError();
-      g_feedNote = (err == 4014)
-                   ? "URL not allowed - whitelist it in Options"
-                   : StringFormat("relay unreachable (err %d)", err);
+      g_relayFails++;
+      g_relayNextTry = GetTickCount() + BackoffMs(g_relayFails);
+
+      string why;
+      if(code == -1)
+        {
+         int err = GetLastError();
+         why = (err == 4014)
+               ? "URL not allowed - whitelist it in Options"
+               : StringFormat("relay unreachable (err %d)", err);
+        }
+      else
+         if(code == 404)
+            why = "channel not on the relay yet";
+         else
+            if(code == 401)
+               why = "relay rejected the key - InpRelayKey must match";
+            else
+               why = StringFormat("relay HTTP %d", code);
+
+      g_feedNote = why;
+      if(g_relayFails == 1 || g_relayFails % 20 == 0)
+         PrintFormat("Copier: %s (failure %d, backing off %d ms)",
+                     why, g_relayFails, BackoffMs(g_relayFails));
       return("");
      }
-   if(code == 404)
-     { g_feedNote = "channel not on the relay yet"; return(""); }
-   if(code != 200)
-     { g_feedNote = StringFormat("relay HTTP %d", code); return(""); }
+
+   // Answered: clear the back-off and remember how long the trip took, so
+   // a poll interval shorter than the round trip is visible as such.
+   if(g_relayFails > 0)
+      PrintFormat("Copier: relay reachable again after %d failed attempt(s).",
+                  g_relayFails);
+   g_relayFails = 0;
+   g_relayRttMs = rtt;
 
    return(CharArrayToString(reply, 0, ArraySize(reply), CP_UTF8));
   }
@@ -1796,6 +1875,17 @@ void PanelUpdate()
                 (g_ctlMult   > 0.0 ? StringFormat("  x%.2f", g_ctlMult) : "") +
                 (g_ctlMaxLot > 0.0 ? StringFormat("  cap %.2f", g_ctlMaxLot) : ""));
    PanelLine(row++, "Channel", clrWhite, Trim(InpChannel));
+
+   // Over the internet the round trip, not InpPollMs, sets how quickly
+   // this slave can learn anything - polling faster than the relay can
+   // answer just burns requests. Show both so the gap is obvious.
+   if(InpTransport == TRANSPORT_HTTP)
+      PanelLine(row++, "Relay",
+                (g_relayFails > 0 ? clrOrangeRed : clrWhite),
+                (g_relayFails > 0
+                 ? StringFormat("%d failure(s) - %s", g_relayFails, g_feedNote)
+                 : StringFormat("round trip %d ms   (polling every %d ms)",
+                                (int)g_relayRttMs, InpPollMs)));
    PanelLine(row++, "Master",  clrWhite,
              (g_mAccount > 0
               ? IntegerToString(g_mAccount) + "  " + g_mBroker

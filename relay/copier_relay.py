@@ -138,7 +138,7 @@ button.danger{background:var(--bad)}
       <table>
         <thead><tr>
           <th>Account</th><th>Broker</th><th>State</th><th>Balance</th>
-          <th>Copies</th><th>Last lot</th><th>Prices</th><th>Errors</th>
+          <th>Copies</th><th>Last lot</th><th>Prices</th><th>Link</th><th>Errors</th>
           <th>Multiplier</th><th>Max lot</th><th></th>
         </tr></thead>
         <tbody id="slaves"></tbody>
@@ -171,9 +171,6 @@ function gate(msg){
 
 function fmt(n, d=2){ return (n===undefined||n===null||n==="") ? "—" : Number(n).toFixed(d); }
 
-// Master lot beside the lot this slave actually got on. Matching numbers
-// are the quickest confirmation that sizing is doing what was asked; a
-// mismatch is flagged and the broker limit behind it sits in the tooltip.
 // Pricing rule in force, how far this broker's market sat from the
 // master's on the last entry, and how many stop levels this broker would
 // not accept as given. Together they account for any residual difference
@@ -188,6 +185,9 @@ function prices(v){
        + (adj ? ` ⚠${adj}` : "");
 }
 
+// Master lot beside the lot this slave actually got on. Matching numbers
+// are the quickest confirmation that sizing is doing what was asked; a
+// mismatch is flagged and the broker limit behind it sits in the tooltip.
 function lots(v){
   const m = Number(v.lastmlot), s = Number(v.lastslot);
   if(!s) return "—";
@@ -219,6 +219,7 @@ function render(s){
       <td>${v.copies ?? "—"}</td>
       <td class="${v.lotnote ? 'warn' : ''}" title="${v.lotnote || v.lotmode || ''}">${lots(v)}</td>
       <td class="${(v.adjusted|0)>0?'warn':''}" title="${v.stopnote || ''}">${prices(v)}</td>
+      <td class="${Number(v.rtt||0) > 500 ? 'warn' : ''}">${v.rtt ? v.rtt + " ms" : "—"}</td>
       <td class="${(v.errors|0)>0?'bad':''}">${v.errors ?? 0}</td>
       <td><input id="mul-${v.account}" value="${v.multiplier || ""}" placeholder="auto"></td>
       <td><input id="max-${v.account}" value="${v.maxlot || ""}" placeholder="none"></td>
@@ -358,6 +359,7 @@ class Handler(BaseHTTPRequestHandler):
                         "adjusted": s.get("adjusted", "0"),
                         "stopnote": s.get("stopnote", ""),
                         "entryoff": s.get("entryoff", ""),
+                        "rtt": s.get("rtt", ""),
                         "age": int(now - s.get("seen", 0)),
                         "paused": int(c["paused"]),
                         "multiplier": c["multiplier"] or "",
