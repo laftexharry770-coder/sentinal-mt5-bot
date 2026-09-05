@@ -102,6 +102,35 @@ travel quickly; it cannot make two brokers fill at one price.
 The master panel shows `MASTER publishing`; each slave shows `COPYING` with the
 master's login, its broker, and the live lot ratio.
 
+## Choosing which trades to publish
+
+By default the master publishes **everything** on the account. `InpOnlyMagic`
+narrows that to a list of magic numbers in `InpMagicList`, comma separated:
+
+```
+InpOnlyMagic = true
+InpMagicList = 0,12345,990001
+```
+
+One account often runs several EAs, each stamping its own magic, alongside
+trades placed by hand. **Manual trades carry magic 0**, so listing `0` beside an
+EA's magic copies both — that is how you mirror your own trading and one robot
+while leaving a second robot out of it.
+
+Spaces and a trailing comma are tolerated, duplicates collapse, and up to 64
+magics are accepted. Anything that is not a number is rejected **at init** with
+the offending entry named, rather than being read as 0 and silently widening the
+filter to include every manual trade — `StringToInteger` returns 0 for
+unparseable text, and 0 is itself a legitimate magic, so the text has to be
+validated rather than just converted. Turning the filter on with an empty list
+refuses to start too, since it would publish nothing at all.
+
+The master panel shows `Magics: 0,12345,990001 only`, or `all (no filter)` when
+it is off — a filter excluding trades you expected to see copied is otherwise
+invisible from the chart.
+
+`InpSymbolFilter` narrows by instrument in the same way, and the two combine.
+
 ## Sizing
 
 `InpLotMode` decides how master lots become slave lots:

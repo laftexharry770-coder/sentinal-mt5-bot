@@ -30,8 +30,8 @@ input string InpRelayKey       = "";          // Shared secret; must match the r
 input int    InpHttpTimeoutMs  = 2000;        // Request timeout (ms)
 
 input group "=== Filters ==="
-input bool   InpOnlyMagic      = false;       // Publish only positions with the magic below
-input long   InpMagicFilter    = 0;           // Magic to publish when the filter is on
+input bool   InpOnlyMagic      = false;       // Publish only the magic numbers listed below
+input string InpMagicList      = "0";         // Magics to publish, comma separated; 0 = manual trades
 input string InpSymbolFilter   = "";          // Only these symbols, comma separated; empty = all
 
 input group "=== Display ==="
@@ -49,6 +49,13 @@ long     g_published = 0;
 datetime g_lastWrite = 0;
 int      g_writeFails = 0;
 string   g_lastError  = "";     // shown on the panel, not only in the log
+
+// Magic numbers to publish, parsed once at init. Several EAs on one
+// account each stamp their own magic, and a manual trade carries 0, so
+// the filter has to be a set rather than a single value.
+#define  MAX_MAGIC 64
+long     g_magic[MAX_MAGIC];
+int      g_magicN = 0;
 
 const string PANEL_PREFIX = "SCM_";
 #define PROTOCOL_VERSION 1
@@ -69,6 +76,8 @@ int OnInit()
       Print("Copier master: InpPublishMs must be >= 10.");
       return(INIT_PARAMETERS_INCORRECT);
      }
+   if(!ParseMagicList())
+      return(INIT_PARAMETERS_INCORRECT);
 
    // Both MT4 and MT5 map this to the same Common\Files directory, which
    // is what lets a master on one broker feed slaves on another - and a
@@ -127,6 +136,111 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   }
 
 //+------------------------------------------------------------------+
+//| Read InpMagicList into g_magic[].                                 |
+//|                                                                   |
+//| Rejecting a bad list at init beats publishing the wrong trades:    |
+//| a typo here silently changes which positions the slaves mirror,    |
+//| and that is not something you want to discover from the account    |
+//| history.                                                           |
+//+------------------------------------------------------------------+
+bool ParseMagicList()
+  {
+   g_magicN = 0;
+
+   if(!InpOnlyMagic)
+      return(true);                  // filter off, the list is not consulted
+
+   string list = Trim(InpMagicList);
+   if(list == "")
+     {
+      Print("Copier master: InpOnlyMagic is on but InpMagicList is empty - "
+            "that would publish nothing at all. List the magics to copy, "
+            "or turn InpOnlyMagic off to publish everything.");
+      return(false);
+     }
+
+   string parts[];
+   int n = StringSplit(list, ',', parts);
+   for(int i = 0; i < n; i++)
+     {
+      string t = Trim(parts[i]);
+      if(t == "")
+         continue;
+
+      // StringToInteger returns 0 for anything it cannot read, which is
+      // also a legitimate magic, so the text has to be checked itself.
+      if(!IsNumeric(t))
+        {
+         PrintFormat("Copier master: '%s' in InpMagicList is not a number.", t);
+         return(false);
+        }
+      long m = StringToInteger(t);
+
+      bool dup = false;
+      for(int j = 0; j < g_magicN && !dup; j++)
+         if(g_magic[j] == m)
+            dup = true;
+      if(dup)
+         continue;
+
+      if(g_magicN >= MAX_MAGIC)
+        {
+         PrintFormat("Copier master: more than %d magics listed; the rest are ignored.",
+                     MAX_MAGIC);
+         break;
+        }
+      g_magic[g_magicN++] = m;
+     }
+
+   if(g_magicN == 0)
+     {
+      Print("Copier master: InpMagicList has no usable entries.");
+      return(false);
+     }
+
+   PrintFormat("Copier master: publishing %d magic number(s): %s",
+               g_magicN, MagicListText());
+   return(true);
+  }
+
+// Digits with an optional leading sign, and nothing else.
+bool IsNumeric(const string s)
+  {
+   int len = StringLen(s);
+   if(len == 0)
+      return(false);
+   for(int i = 0; i < len; i++)
+     {
+      ushort c = StringGetCharacter(s, i);
+      if(i == 0 && (c == '-' || c == '+') && len > 1)
+         continue;
+      if(c < '0' || c > '9')
+         return(false);
+     }
+   return(true);
+  }
+
+string MagicListText()
+  {
+   string s = "";
+   for(int i = 0; i < g_magicN; i++)
+      s += (i ? "," : "") + IntegerToString(g_magic[i]);
+   return(s);
+  }
+
+// Manual trades carry magic 0, so listing 0 alongside an EA's magic is
+// how you copy both.
+bool MagicAllowed(const long m)
+  {
+   if(!InpOnlyMagic)
+      return(true);
+   for(int i = 0; i < g_magicN; i++)
+      if(g_magic[i] == m)
+         return(true);
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
 //| Build the payload and write it if it changed                     |
 //+------------------------------------------------------------------+
 void Publish()
@@ -138,7 +252,7 @@ void Publish()
      {
       if(!position.SelectByIndex(i))
          continue;
-      if(InpOnlyMagic && position.Magic() != InpMagicFilter)
+      if(!MagicAllowed((long)position.Magic()))
          continue;
       if(!SymbolAllowed(position.Symbol()))
          continue;
@@ -169,7 +283,7 @@ void Publish()
       ulong ticket = OrderGetTicket(i);
       if(ticket == 0)
          continue;
-      if(InpOnlyMagic && (long)OrderGetInteger(ORDER_MAGIC) != InpMagicFilter)
+      if(!MagicAllowed((long)OrderGetInteger(ORDER_MAGIC)))
          continue;
 
       string sym = OrderGetString(ORDER_SYMBOL);
@@ -389,6 +503,10 @@ void PanelUpdate()
              DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + " " +
              AccountInfoString(ACCOUNT_CURRENCY));
    PanelLine(row++, "Published",clrWhite, IntegerToString((int)g_published) + " positions");
+   // Which trades are eligible at all. A filter quietly excluding the
+   // trades you expected to see copied is otherwise invisible from here.
+   PanelLine(row++, "Magics", (InpOnlyMagic ? clrGold : clrWhite),
+             (InpOnlyMagic ? MagicListText() + " only" : "all (no filter)"));
    PanelLine(row++, "Last write",clrWhite,
              (g_lastWrite > 0 ? TimeToString(g_lastWrite, TIME_SECONDS) : "never"));
    PanelLine(row++, "Transport", clrWhite,
