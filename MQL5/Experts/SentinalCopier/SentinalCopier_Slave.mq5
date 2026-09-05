@@ -157,6 +157,13 @@ int      g_resized  = 0;
 int      g_adjusted = 0;         // stops this broker would not take as given
 bool     g_clamped  = false;     // the last StopsFor had to move a level
 string   g_stopNote = "";
+
+// Operations the broker has just refused. A rejection repeats on the next
+// cycle and every cycle after it, so without a back-off one bad stop
+// becomes ten errors a second and a log nobody can read.
+ulong    g_failTicket[MAX_POS];
+datetime g_failWhen[MAX_POS];
+int      g_failN = 0;
 double   g_lastSlip = 0.0;       // points between master fill and ours
 
 // Last sizing decision, for the panel: what the master traded, what we
@@ -524,9 +531,10 @@ void Reconcile()
          else
            {
             g_errors++;
-            PrintFormat("Copier: failed to close #%I64u. retcode=%d (%s)",
+            PrintFormat("Copier: failed to close #%I64u. retcode=%d (%s) - %s",
                         position.Ticket(), trade.ResultRetcode(),
-                        trade.ResultRetcodeDescription());
+                        trade.ResultRetcodeDescription(),
+                        RetcodeHint((int)trade.ResultRetcode()));
            }
         }
      }
@@ -690,8 +698,9 @@ void ReduceCopyTo(const ulong masterTicket, const string sym, const double targe
          else
            {
             g_errors++;
-            PrintFormat("Copier: partial close failed on #%I64u. retcode=%d (%s)",
-                        ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+            PrintFormat("Copier: partial close failed on #%I64u. retcode=%d (%s) - %s",
+                        ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription(),
+                        RetcodeHint((int)trade.ResultRetcode()));
            }
         }
      }
@@ -737,8 +746,9 @@ void IncreaseCopy(const int k, const string sym, const double addLots)
    else
      {
       g_errors++;
-      PrintFormat("Copier: add-on failed for %s. retcode=%d (%s)",
-                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      PrintFormat("Copier: add-on failed for %s. retcode=%d (%s) - %s",
+                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription(),
+                  RetcodeHint((int)trade.ResultRetcode()));
      }
   }
 
@@ -893,8 +903,13 @@ void PlacePending(const int k)
    else
      {
       g_errors++;
-      PrintFormat("Copier: pending failed on %s. retcode=%d (%s)",
-                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      g_stopNote = StringFormat("pending rejected %d (%s)",
+                                (int)trade.ResultRetcode(),
+                                RetcodeHint((int)trade.ResultRetcode()));
+      PrintFormat("Copier: pending failed on %s @ %s. retcode=%d (%s) - %s",
+                  sym, DoubleToString(price, digits),
+                  trade.ResultRetcode(), trade.ResultRetcodeDescription(),
+                  RetcodeHint((int)trade.ResultRetcode()));
      }
   }
 
@@ -951,6 +966,29 @@ void OpenCopy(const int k)
         }
      }
 
+   // Check the margin before asking, so a copy this account cannot afford
+   // reports the actual shortfall instead of a bare "not enough money".
+   // Copying the master lot for lot on a smaller account is exactly where
+   // this bites, and it bites only on the larger positions - which reads
+   // as "some trades copy and some do not".
+   double need = 0.0;
+   if(OrderCalcMargin(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                      sym, lots, price, need))
+     {
+      double have = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+      if(need > have)
+        {
+         g_errors++;
+         g_lotNote = StringFormat("needs %.2f margin, have %.2f", need, have);
+         PrintFormat("Copier: cannot afford master #%I64u - %.2f lots of %s needs "
+                     "%.2f %s margin and this account has %.2f free. Use a ratio "
+                     "InpLotMode, or cap it with InpMaxLot.",
+                     g_mTicket[k], lots, sym, need,
+                     AccountInfoString(ACCOUNT_CURRENCY), have);
+         return;
+        }
+     }
+
    double sl = 0.0, tp = 0.0;
    if(InpCopySLTP)
       StopsFor(k, sym, price, buy, sl, tp);
@@ -971,8 +1009,17 @@ void OpenCopy(const int k)
    else
      {
       g_errors++;
-      PrintFormat("Copier: open failed for %s. retcode=%d (%s)",
-                  sym, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      g_stopNote = StringFormat("open rejected %d (%s)",
+                                (int)trade.ResultRetcode(),
+                                RetcodeHint((int)trade.ResultRetcode()));
+      PrintFormat("Copier: open failed for %s %.2f lots. retcode=%d (%s) - %s"
+                  "  [SL %s TP %s, market %s/%s]",
+                  sym, lots, trade.ResultRetcode(), trade.ResultRetcodeDescription(),
+                  RetcodeHint((int)trade.ResultRetcode()),
+                  DoubleToString(sl, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
+                  DoubleToString(tp, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
+                  DoubleToString(bid, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
+                  DoubleToString(ask, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)));
      }
   }
 
@@ -1150,9 +1197,108 @@ void SyncStops(const ulong slaveTicket, const int k)
       tol = MathMax(tol, MathMax(minGap, spread * 2.0));
      }
 
-   if(MathAbs(sl - curSL) > tol || MathAbs(tp - curTP) > tol)
-      if(!trade.PositionModify(slaveTicket, sl, tp))
-         g_errors++;
+   if(MathAbs(sl - curSL) <= tol && MathAbs(tp - curTP) <= tol)
+      return;
+
+   // A broker that refuses this stop will refuse it again in 100 ms, so
+   // retrying every cycle achieves nothing except thousands of identical
+   // errors and a hammered server. Back off and try again in a moment.
+   if(RecentlyFailed(slaveTicket))
+      return;
+
+   if(trade.PositionModify(slaveTicket, sl, tp))
+      return;
+
+   g_errors++;
+   NoteFailure(slaveTicket);
+
+   int rc = (int)trade.ResultRetcode();
+   g_stopNote = StringFormat("stop rejected %d (%s)", rc, RetcodeHint(rc));
+   PrintFormat("Copier: stop update refused on #%I64u %s. retcode=%d (%s) - %s"
+               "  [wanted SL %s TP %s, market %s/%s]",
+               slaveTicket, sym, rc, trade.ResultRetcodeDescription(),
+               RetcodeHint(rc),
+               DoubleToString(sl, digits), DoubleToString(tp, digits),
+               DoubleToString(SymbolInfoDouble(sym, SYMBOL_BID), digits),
+               DoubleToString(SymbolInfoDouble(sym, SYMBOL_ASK), digits));
+  }
+
+//+------------------------------------------------------------------+
+//| Plain-language reason for the retcodes this EA actually provokes. |
+//| The broker's own description says "Invalid stops"; what it does    |
+//| not say is which of the several possible causes applied.           |
+//+------------------------------------------------------------------+
+string RetcodeHint(const int rc)
+  {
+   switch(rc)
+     {
+      case TRADE_RETCODE_NO_MONEY:
+         return("not enough free margin for this lot size on this account");
+      case TRADE_RETCODE_INVALID_STOPS:
+         return("stop level rejected: too close to the market, or the wrong "
+                "side of it, for this broker");
+      case TRADE_RETCODE_INVALID_VOLUME:
+         return("lot size outside this broker's min/max/step for the symbol");
+      case TRADE_RETCODE_MARKET_CLOSED:
+         return("market closed for this symbol here");
+      case TRADE_RETCODE_TRADE_DISABLED:
+         return("trading disabled for this symbol or account");
+      case TRADE_RETCODE_INVALID_PRICE:
+         return("price moved away before the order reached the server");
+      case TRADE_RETCODE_REQUOTE:
+      case TRADE_RETCODE_PRICE_CHANGED:
+      case TRADE_RETCODE_PRICE_OFF:
+         return("price moved during execution - transient, it will retry");
+      case TRADE_RETCODE_NO_CHANGES:
+         return("the stop is already where we asked for it");
+      case TRADE_RETCODE_TOO_MANY_REQUESTS:
+         return("sending faster than this broker allows - raise InpPollMs");
+      case TRADE_RETCODE_LIMIT_POSITIONS:
+      case TRADE_RETCODE_LIMIT_VOLUME:
+         return("broker's own position or volume ceiling reached");
+      case TRADE_RETCODE_CONNECTION:
+         return("no connection to the trade server");
+      default:
+         return("see the MQL5 trade server return codes");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Short back-off for an operation the broker just refused           |
+//+------------------------------------------------------------------+
+#define FAIL_BACKOFF_SEC 5
+
+bool RecentlyFailed(const ulong ticket)
+  {
+   datetime now = TimeCurrent();
+   for(int i = 0; i < g_failN; i++)
+      if(g_failTicket[i] == ticket)
+         return(now - g_failWhen[i] < FAIL_BACKOFF_SEC);
+   return(false);
+  }
+
+void NoteFailure(const ulong ticket)
+  {
+   datetime now = TimeCurrent();
+   for(int i = 0; i < g_failN; i++)
+      if(g_failTicket[i] == ticket)
+        { g_failWhen[i] = now; return; }
+
+   if(g_failN < MAX_POS)
+     {
+      g_failTicket[g_failN] = ticket;
+      g_failWhen[g_failN]   = now;
+      g_failN++;
+      return;
+     }
+
+   // Full: replace the oldest rather than losing the newest.
+   int oldest = 0;
+   for(int i = 1; i < g_failN; i++)
+      if(g_failWhen[i] < g_failWhen[oldest])
+         oldest = i;
+   g_failTicket[oldest] = ticket;
+   g_failWhen[oldest]   = now;
   }
 
 //+------------------------------------------------------------------+
@@ -1686,8 +1832,12 @@ void PanelUpdate()
               ? "ABSOLUTE - master's exact levels"
               : "DISTANCE - master's distances") +
              (g_lastSlip > 0.0 ? StringFormat("   entry %.0f pts off", g_lastSlip) : ""));
+   // Whatever last went wrong, in words. An error counter on its own never
+   // said which of a dozen possible causes was actually in play.
    if(g_stopNote != "")
-      PanelLine(row++, "Stops", clrGold, g_stopNote);
+      PanelLine(row++, "Last issue", clrGold, g_stopNote);
+   if(g_lotNote != "")
+      PanelLine(row++, "Sizing note", clrGold, g_lotNote);
 
    PanelLine(row++, "Master pos", clrWhite, IntegerToString(g_mCount));
    PanelLine(row++, "Copies",  clrWhite,
