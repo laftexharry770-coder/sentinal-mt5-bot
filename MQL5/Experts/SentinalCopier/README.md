@@ -154,10 +154,15 @@ Pending orders are copied as orders, not waited on and then chased as market
 entries - a straddle or breakout master holds nothing but pendings until one
 triggers.
 
-The level travels as a **distance from the master's market price** at the moment
-it published, applied to the slave broker's market now. Copying the absolute
-level would misplace the order by whatever the two brokers differ by, which on
-gold is routinely cents.
+Under the default `PRICE_ABSOLUTE` the order goes in at the master's exact
+level — a pending order is the one case where that can always be honoured, since
+nothing has to fill right now. It is still nudged if it lands the wrong side of
+this broker's market, which would otherwise be rejected outright.
+
+`PRICE_DISTANCE` instead sends the level as a **distance from the master's
+market price** at the moment it published, applied to the slave broker's market
+now — the right choice when two brokers quote far enough apart that the master's
+absolute level means something different on your account.
 
 When a master pending fills, its ticket carries over as the position id, so the
 copy is recognised as the same trade and is not duplicated or closed. Reversed
@@ -168,8 +173,8 @@ single sensible meaning.
 
 Stops are **re-synced every cycle**, not just at entry. Whatever moves the
 master's stop - a trailing EA, a manual drag, a break-even rule - the master
-republishes within 100 ms and the slave matches the new distance on its own
-entry.
+republishes within 100 ms and the slave follows: to the same price under
+`PRICE_ABSOLUTE`, to the same distance under `PRICE_DISTANCE`.
 
 `SyncStops` compares the master's current stop distance against the copy's and
 modifies when they differ by more than 5 points, so a trailing stop follows
@@ -208,12 +213,60 @@ symbol, the base it looked for, and the `InpSymbolMap` line that would fix it:
 XAUUSD=XAUUSD.m,US30=US30.cash
 ```
 
-## Stops
+## Stops and prices
 
-Stops and targets are copied as **distances from the master's own fill**, then
-applied to the slave's fill. Two brokers quoting a few cents apart therefore get
-the same risk in money, not the same absolute price. Distances below the slave
-broker's minimum stop distance are widened to it.
+`InpPriceMode` decides what "the same" means.
+
+| Mode | Stops and targets | Pending order level |
+|---|---|---|
+| `PRICE_ABSOLUTE` *(default)* | the master's exact price | the master's exact price |
+| `PRICE_DISTANCE` | the master's distance from its own fill | the master's distance from its own market |
+
+**`PRICE_ABSOLUTE` puts the stop on the master's number.** Master stop at
+3395.00, slave stop at 3395.00. A trailing master stop is republished within
+100 ms and the copy is moved to the same new price, so both accounts show the
+same levels throughout the life of the trade.
+
+Two things can still move a level, and both are the broker's doing rather than
+the copier's:
+
+- **The level has to sit on the correct side of this broker's market.** If the
+  two brokers quote far enough apart that the master's stop is already through
+  the slave's price, it cannot go there.
+- **Every broker enforces a minimum distance** between the market and a stop
+  (`SYMBOL_TRADE_STOPS_LEVEL`), and they do not all use the same one.
+
+When either applies, the level moves the smallest amount that makes it legal — a
+stop a few points from where you asked for it beats no stop at all — and the
+slave panel says `SL moved N pts to clear this broker's minimum`, with an `adj`
+count in the session line and a `⚠` on the web panel. No note means every level
+went on exactly where the master had it.
+
+A level pinned to the broker's minimum drifts with the market, so the re-sync
+tolerance widens to that gap; otherwise a pinned stop would be rewritten on
+every tick.
+
+### What absolute prices cannot do
+
+**A market entry fills at the market.** If the master bought at 3401.55 and this
+broker shows 3401.80 by the time the copy goes in, it fills at 3401.80 — no
+copier can buy at a price that has already gone. The gap is measured and shown
+as `entry N pts off`. `InpMaxEntryDiffPts` skips a copy that would enter more
+than N points from the master's fill; the default `0` never skips, because a
+missing trade is usually worse than a slightly different one. Pending orders
+have no such limit — nothing has to fill immediately, so they go in at the
+master's exact level.
+
+**Identical prices mean different risk when brokers disagree.** If this broker
+quotes $2 away from the master's, copying the stop price exactly gives you a
+stop $2 further from your entry than it was from the master's — same number on
+the chart, different money at risk. `PRICE_DISTANCE` is the mode for that other
+intent: it reproduces the master's risk rather than the master's numbers. A
+reversed slave always uses distances regardless, since a mirrored trade needs
+its stop on the opposite side of the market.
+
+Watch `entry N pts off` for a few trades. Consistently near zero means the two
+brokers agree and absolute prices cost you nothing.
 
 Under `InpReverse` the two swap: the master's stop distance becomes the slave's
 target and vice versa, because the master's stop being hit is the price moving

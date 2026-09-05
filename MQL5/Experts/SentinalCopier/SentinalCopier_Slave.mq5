@@ -35,6 +35,12 @@ enum ETransport
    TRANSPORT_HTTP    // Relay URL - master on another device
   };
 
+enum EPriceMode
+  {
+   PRICE_ABSOLUTE,   // The master's exact price levels
+   PRICE_DISTANCE    // The master's distances, applied to this fill
+  };
+
 input group "=== Channel ==="
 input string     InpChannel     = "sentinal"; // Channel name (must match the master)
 input ETransport InpTransport   = TRANSPORT_FILE; // How this slave receives the feed
@@ -58,8 +64,10 @@ input double   InpFixedLot      = 0.01;       // Fixed lot (LOT_FIXED)
 input double   InpMaxLot        = 0.0;        // Hard cap per trade; 0 = broker maximum
 
 input group "=== Behaviour ==="
-input bool     InpCopySLTP      = true;       // Copy stop loss and take profit
+input bool       InpCopySLTP    = true;       // Copy stop loss and take profit
+input EPriceMode InpPriceMode   = PRICE_ABSOLUTE; // Same prices, or same distances
 input bool     InpCopyVolume    = true;       // Follow the master's partial closes and add-ons
+input int      InpMaxEntryDiffPts = 0;        // Skip a copy this far off the master's price; 0 = never skip
 input bool     InpReverse       = false;      // Mirror inverted (buy becomes sell)
 input int      InpMaxPositions  = 50;         // Refuse to exceed this many copies
 input int      InpMaxSlippage   = 30;         // Max deviation (points)
@@ -146,6 +154,10 @@ int      g_opened   = 0;
 int      g_closed   = 0;
 int      g_errors   = 0;
 int      g_resized  = 0;
+int      g_adjusted = 0;         // stops this broker would not take as given
+bool     g_clamped  = false;     // the last StopsFor had to move a level
+string   g_stopNote = "";
+double   g_lastSlip = 0.0;       // points between master fill and ours
 
 // Last sizing decision, for the panel: what the master traded, what we
 // actually got on, and why they differ when they do.
@@ -357,6 +369,10 @@ void ReportStatus()
       "lastmlot="   + DoubleToString(g_lastMLot, 2)                      + "\n" +
       "lastslot="   + DoubleToString(g_lastSLot, 2)                      + "\n" +
       "lotnote="    + g_lotNote                                          + "\n" +
+      "pricemode="  + EnumToString(InpPriceMode)                         + "\n" +
+      "adjusted="   + IntegerToString(g_adjusted)                        + "\n" +
+      "stopnote="   + g_stopNote                                         + "\n" +
+      "entryoff="   + DoubleToString(g_lastSlip, 0)                      + "\n" +
       "feed="       + g_feedNote                                         + "\n";
 
    char post[], reply[];
@@ -818,15 +834,40 @@ void PlacePending(const int k)
    if(market <= 0.0 || g_oMarket[k] <= 0.0)
      { g_errors++; return; }
 
-   double price = NormalizeDouble(market + (g_oPrice[k] - g_oMarket[k]), digits);
+   // A pending order is the one case where the master's exact level can
+   // always be honoured: nothing has to fill right now, so the price is
+   // simply the price. Distance mode still exists for brokers quoting far
+   // enough apart that the master's level means something different here.
+   double price;
+   if(InpPriceMode == PRICE_ABSOLUTE)
+      price = NormalizeDouble(g_oPrice[k], digits);
+   else
+      price = NormalizeDouble(market + (g_oPrice[k] - g_oMarket[k]), digits);
+
+   // The level still has to sit on the correct side of THIS broker's
+   // market or the order is rejected outright.
+   double point  = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double minGap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+   bool   above  = (type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_SELL_LIMIT);
+   double edge   = above ? market + minGap : market - minGap;
+   if(above && price < edge) price = NormalizeDouble(edge, digits);
+   if(!above && price > edge) price = NormalizeDouble(edge, digits);
 
    double sl = 0.0, tp = 0.0;
    if(InpCopySLTP)
      {
-      if(g_oSL[k] > 0.0)
-         sl = NormalizeDouble(price - (g_oPrice[k] - g_oSL[k]), digits);
-      if(g_oTP[k] > 0.0)
-         tp = NormalizeDouble(price - (g_oPrice[k] - g_oTP[k]), digits);
+      if(InpPriceMode == PRICE_ABSOLUTE)
+        {
+         if(g_oSL[k] > 0.0) sl = NormalizeDouble(g_oSL[k], digits);
+         if(g_oTP[k] > 0.0) tp = NormalizeDouble(g_oTP[k], digits);
+        }
+      else
+        {
+         if(g_oSL[k] > 0.0)
+            sl = NormalizeDouble(price - (g_oPrice[k] - g_oSL[k]), digits);
+         if(g_oTP[k] > 0.0)
+            tp = NormalizeDouble(price - (g_oPrice[k] - g_oTP[k]), digits);
+        }
      }
 
    string comment = TAG + IntegerToString((long)g_oTicket[k]);
@@ -892,8 +933,24 @@ void OpenCopy(const int k)
      }
    double price = buy ? ask : bid;
 
-   // Stops travel as DISTANCES from the master's own fill, so a broker
-   // quoting a different absolute price still gets the same risk.
+   // How far this broker's market is from where the master got filled.
+   // A market order fills at the market - there is no way to buy at a
+   // price that has already gone - so this is reported, and optionally
+   // used to refuse a copy that would enter somewhere quite different.
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(point > 0.0 && g_mOpen[k] > 0.0)
+     {
+      g_lastSlip = MathAbs(price - g_mOpen[k]) / point;
+      if(InpMaxEntryDiffPts > 0 && g_lastSlip > InpMaxEntryDiffPts)
+        {
+         g_feedNote = StringFormat("entry %d pts off master", (int)g_lastSlip);
+         PrintFormat("Copier: skipped master #%I64u - this broker is %d points "
+                     "from the master's fill (limit %d).",
+                     g_mTicket[k], (int)g_lastSlip, InpMaxEntryDiffPts);
+         return;
+        }
+     }
+
    double sl = 0.0, tp = 0.0;
    if(InpCopySLTP)
       StopsFor(k, sym, price, buy, sl, tp);
@@ -922,6 +979,53 @@ void OpenCopy(const int k)
 //+------------------------------------------------------------------+
 //| Translate the master's stops onto this symbol                    |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Take the master's absolute level and return the nearest one this  |
+//| broker will actually accept.                                      |
+//|                                                                   |
+//| Two brokers do not quote the same price at the same instant, and   |
+//| they do not enforce the same minimum stop distance. A level that   |
+//| is legal on the master can therefore be on the wrong side of this  |
+//| broker's market, or simply too close to it. Refusing outright      |
+//| would leave the copy with no stop at all, which is worse than a    |
+//| stop a few points from where it was asked for - so move it the     |
+//| smallest amount that makes it legal and say so on the panel.       |
+//+------------------------------------------------------------------+
+double LegalStop(const string sym, const double want, const bool buy,
+                 const bool isStop, const double minGap, const int digits)
+  {
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(bid <= 0.0 || ask <= 0.0)
+      return(NormalizeDouble(want, digits));
+
+   // Which side of the market this level has to be on, and the closest it
+   // is allowed to sit. A buy's stop is below and its target above; a
+   // sell's are the other way round.
+   bool  mustBeBelow = (buy == isStop);
+   double limit      = mustBeBelow ? bid - minGap : ask + minGap;
+
+   double got = want;
+   if(mustBeBelow && want > limit)
+      got = limit;
+   if(!mustBeBelow && want < limit)
+      got = limit;
+
+   got = NormalizeDouble(got, digits);
+
+   if(MathAbs(got - want) > SymbolInfoDouble(sym, SYMBOL_POINT) * 0.5)
+     {
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      int    off   = (point > 0.0) ? (int)MathRound(MathAbs(got - want) / point) : 0;
+      g_stopNote = StringFormat("%s moved %d pts to clear this broker's minimum",
+                                (isStop ? "SL" : "TP"), off);
+      g_adjusted++;
+      g_clamped = true;
+     }
+
+   return(got);
+  }
+
 void StopsFor(const int k, const string sym, const double price,
               const bool buy, double &sl, double &tp)
   {
@@ -934,6 +1038,20 @@ void StopsFor(const int k, const string sym, const double price,
 
    if(g_mOpen[k] <= 0.0)
       return;
+
+   // Absolute: put the stop on the master's own price, to the digit.
+   // Reversing has no absolute meaning - the master's stop sits below the
+   // market and the mirrored trade needs it above - so a reversed slave
+   // always falls through to distances.
+   if(InpPriceMode == PRICE_ABSOLUTE && !InpReverse)
+     {
+      g_clamped = false;
+      if(g_mSL[k] > 0.0)
+         sl = LegalStop(sym, g_mSL[k], buy, true,  minGap, digits);
+      if(g_mTP[k] > 0.0)
+         tp = LegalStop(sym, g_mTP[k], buy, false, minGap, digits);
+      return;
+     }
 
    double slDist = (g_mSL[k] > 0.0) ? MathAbs(g_mOpen[k] - g_mSL[k]) : 0.0;
    double tpDist = (g_mTP[k] > 0.0) ? MathAbs(g_mOpen[k] - g_mTP[k]) : 0.0;
@@ -1019,6 +1137,18 @@ void SyncStops(const ulong slaveTicket, const int k)
    double curSL = position.StopLoss();
    double curTP = position.TakeProfit();
    double tol   = 5 * point;
+
+   // A level the broker's minimum forced us to move is pinned to the
+   // market, so it drifts with every tick. Matching it that closely would
+   // fire a modification on each one; widen the tolerance to the gap
+   // itself so a pinned stop is set once and then left alone until the
+   // master genuinely moves it.
+   if(g_clamped)
+     {
+      double minGap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+      double spread = SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID);
+      tol = MathMax(tol, MathMax(minGap, spread * 2.0));
+     }
 
    if(MathAbs(sl - curSL) > tol || MathAbs(tp - curTP) > tol)
       if(!trade.PositionModify(slaveTicket, sl, tp))
@@ -1547,12 +1677,24 @@ void PanelUpdate()
                              g_lastMLot, g_lastSLot,
                              (g_lotNote == "" ? "" : "   (" + g_lotNote + ")")));
 
+   // Which pricing rule is in force, and how far this broker's market sat
+   // from the master's on the last entry - the number that explains any
+   // remaining difference between the two accounts.
+   PanelLine(row++, "Prices",
+             (InpPriceMode == PRICE_ABSOLUTE ? clrWhite : clrGold),
+             (InpPriceMode == PRICE_ABSOLUTE
+              ? "ABSOLUTE - master's exact levels"
+              : "DISTANCE - master's distances") +
+             (g_lastSlip > 0.0 ? StringFormat("   entry %.0f pts off", g_lastSlip) : ""));
+   if(g_stopNote != "")
+      PanelLine(row++, "Stops", clrGold, g_stopNote);
+
    PanelLine(row++, "Master pos", clrWhite, IntegerToString(g_mCount));
    PanelLine(row++, "Copies",  clrWhite,
              IntegerToString(CountCopies()) + " / " + IntegerToString(InpMaxPositions));
    PanelLine(row++, "Session", clrWhite,
-             StringFormat("opened %d  closed %d  resized %d  errors %d",
-                          g_opened, g_closed, g_resized, g_errors));
+             StringFormat("opened %d  closed %d  resized %d  adj %d  errors %d",
+                          g_opened, g_closed, g_resized, g_adjusted, g_errors));
    if(InpReverse)
       PanelLine(row++, "Mode", clrGold, "REVERSED - buys copy as sells");
 
