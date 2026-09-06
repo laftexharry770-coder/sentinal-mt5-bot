@@ -209,12 +209,17 @@ function render(s){
 
   const rows = s.slaves.map(v => {
     const off = v.age > 120;
-    const cls = off ? "bad" : (v.paused ? "warn" : "ok");
-    const label = off ? "OFFLINE" : (v.paused ? "PAUSED" : (v.state || "—"));
+    // Connected but copying nothing is its own state, and the reason the
+    // slave reported is the answer to the only question being asked here.
+    const blocked = !off && !v.paused && v.blocked;
+    const cls = off ? "bad" : (v.paused ? "warn" : (blocked ? "bad" : "ok"));
+    const label = off ? "OFFLINE" : (v.paused ? "PAUSED"
+                                   : (blocked ? "BLOCKED" : (v.state || "—")));
     return `<tr>
       <td>${v.account}</td>
       <td>${v.broker || "—"}</td>
-      <td><span class="pill ${cls}">${label}</span></td>
+      <td><span class="pill ${cls}" title="${v.blocked || ''}">${label}</span>
+          ${blocked ? `<div class="hint" style="margin:2px 0 0">${v.blocked}</div>` : ""}</td>
       <td>${fmt(v.balance)}</td>
       <td>${v.copies ?? "—"}</td>
       <td class="${v.lotnote ? 'warn' : ''}" title="${v.lotnote || v.lotmode || ''}">${lots(v)}</td>
@@ -360,6 +365,7 @@ class Handler(BaseHTTPRequestHandler):
                         "stopnote": s.get("stopnote", ""),
                         "entryoff": s.get("entryoff", ""),
                         "rtt": s.get("rtt", ""),
+                        "blocked": s.get("blocked", ""),
                         "age": int(now - s.get("seen", 0)),
                         "paused": int(c["paused"]),
                         "multiplier": c["multiplier"] or "",

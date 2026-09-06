@@ -188,6 +188,17 @@ uint BackoffMs(const int fails)
 ulong    g_failTicket[MAX_POS];
 datetime g_failWhen[MAX_POS];
 int      g_failN = 0;
+
+// The same idea for entries, keyed by MASTER ticket and kept in its own
+// table so a slave ticket can never collide with a master one. A copy
+// that cannot be placed - unknown symbol, no margin, stops the broker
+// refuses - fails identically on the next cycle and every cycle after,
+// which is how one unplaceable trade turns into hundreds of errors.
+ulong    g_openTicket[MAX_POS];
+uint     g_openWhen[MAX_POS];
+int      g_openCount[MAX_POS];
+int      g_openN = 0;
+string   g_blockNote = "";       // why nothing is being copied right now
 double   g_lastSlip = 0.0;       // points between master fill and ours
 
 // Last sizing decision, for the panel: what the master traded, what we
@@ -405,6 +416,7 @@ void ReportStatus()
       "stopnote="   + g_stopNote                                         + "\n" +
       "entryoff="   + DoubleToString(g_lastSlip, 0)                      + "\n" +
       "rtt="        + IntegerToString((int)g_relayRttMs)                 + "\n" +
+      "blocked="    + g_blockNote                                        + "\n" +
       "feed="       + g_feedNote                                         + "\n";
 
    // Backed off separately from the feed: reporting status is a
@@ -649,6 +661,13 @@ void Reconcile()
             g_feedNote = "position limit reached";
             continue;
            }
+
+         // A trade the broker just refused will be refused again in
+         // 100 ms. Wait before asking, or one unplaceable copy becomes
+         // hundreds of identical errors and an unreadable log.
+         if(OpenRecentlyFailed(g_mTicket[k]))
+            continue;
+
          OpenCopy(k);
         }
       else
@@ -885,6 +904,9 @@ void ReconcileOrders()
          g_feedNote = "position limit reached";
          continue;
         }
+      if(OpenRecentlyFailed(g_oTicket[k]))
+         continue;
+
       PlacePending(k);
      }
   }
@@ -906,8 +928,11 @@ void PlacePending(const int k)
    if(sym == "")
      {
       g_errors++;
-      PrintFormat("Copier: no local symbol matches '%s' - add it to InpSymbolMap.",
-                  g_oSymbol[k]);
+      g_blockNote = StringFormat("no symbol here matches '%s'", g_oSymbol[k]);
+      if(NoteOpenFailure(g_oTicket[k]) == 1)
+         PrintFormat("Copier: NOT COPYING pending #%I64u - no symbol on this broker "
+                     "matches '%s'. Add it to InpSymbolMap.",
+                     g_oTicket[k], g_oSymbol[k]);
       return;
      }
 
@@ -975,6 +1000,8 @@ void PlacePending(const int k)
      {
       g_opened++;
       MarkHandled(g_oTicket[k], g_oVolume[k]);
+      ClearOpenFailure(g_oTicket[k]);
+      g_blockNote = "";
       PrintFormat("Copier: pending %s %.2f %s @ %s copying master #%I64u.",
                   EnumToString((ENUM_ORDER_TYPE)type), lots, sym,
                   DoubleToString(price, digits), g_oTicket[k]);
@@ -982,10 +1009,12 @@ void PlacePending(const int k)
    else
      {
       g_errors++;
-      g_stopNote = StringFormat("pending rejected %d (%s)",
-                                (int)trade.ResultRetcode(),
-                                RetcodeHint((int)trade.ResultRetcode()));
-      PrintFormat("Copier: pending failed on %s @ %s. retcode=%d (%s) - %s",
+      int rc = (int)trade.ResultRetcode();
+      g_stopNote  = StringFormat("pending rejected %d (%s)", rc, RetcodeHint(rc));
+      g_blockNote = StringFormat("broker refused pending: %s", RetcodeHint(rc));
+      int nfail = NoteOpenFailure(g_oTicket[k]);
+      if(nfail == 1 || nfail % 20 == 0)
+         PrintFormat("Copier: NOT COPYING - pending failed on %s @ %s. retcode=%d (%s) - %s",
                   sym, DoubleToString(price, digits),
                   trade.ResultRetcode(), trade.ResultRetcodeDescription(),
                   RetcodeHint((int)trade.ResultRetcode()));
@@ -1001,8 +1030,11 @@ void OpenCopy(const int k)
    if(sym == "")
      {
       g_errors++;
-      PrintFormat("Copier: no local symbol matches '%s' - add it to InpSymbolMap.",
-                  g_mSymbol[k]);
+      g_blockNote = StringFormat("no symbol here matches '%s'", g_mSymbol[k]);
+      if(NoteOpenFailure(g_mTicket[k]) == 1)
+         PrintFormat("Copier: NOT COPYING master #%I64u - no symbol on this broker "
+                     "matches '%s'. Add it to InpSymbolMap, e.g. \"%s=<local name>\".",
+                     g_mTicket[k], g_mSymbol[k], g_mSymbol[k]);
       return;
      }
 
@@ -1010,7 +1042,10 @@ void OpenCopy(const int k)
    if(lots <= 0.0)
      {
       g_errors++;
-      PrintFormat("Copier: computed lot for %s is below this broker's minimum.", sym);
+      g_blockNote = StringFormat("lot for %s came out as zero", sym);
+      if(NoteOpenFailure(g_mTicket[k]) == 1)
+         PrintFormat("Copier: NOT COPYING master #%I64u - computed lot for %s is zero. "
+                     "Is %s in Market Watch on this account?", g_mTicket[k], sym, sym);
       return;
      }
 
@@ -1022,7 +1057,11 @@ void OpenCopy(const int k)
    if(ask <= 0.0 || bid <= 0.0)
      {
       g_errors++;
-      PrintFormat("Copier: no price for %s yet.", sym);
+      g_blockNote = StringFormat("no price for %s yet", sym);
+      if(NoteOpenFailure(g_mTicket[k]) == 1)
+         PrintFormat("Copier: NOT COPYING master #%I64u - no quote for %s on this "
+                     "account. Add it to Market Watch and check it is tradable.",
+                     g_mTicket[k], sym);
       return;
      }
    double price = buy ? ask : bid;
@@ -1058,12 +1097,14 @@ void OpenCopy(const int k)
       if(need > have)
         {
          g_errors++;
-         g_lotNote = StringFormat("needs %.2f margin, have %.2f", need, have);
-         PrintFormat("Copier: cannot afford master #%I64u - %.2f lots of %s needs "
-                     "%.2f %s margin and this account has %.2f free. Use a ratio "
-                     "InpLotMode, or cap it with InpMaxLot.",
-                     g_mTicket[k], lots, sym, need,
-                     AccountInfoString(ACCOUNT_CURRENCY), have);
+         g_lotNote   = StringFormat("needs %.2f margin, have %.2f", need, have);
+         g_blockNote = StringFormat("not enough margin (%.2f of %.2f)", have, need);
+         if(NoteOpenFailure(g_mTicket[k]) == 1)
+            PrintFormat("Copier: NOT COPYING master #%I64u - %.2f lots of %s needs "
+                        "%.2f %s margin and this account has %.2f free. Use a ratio "
+                        "InpLotMode, or cap it with InpMaxLot.",
+                        g_mTicket[k], lots, sym, need,
+                        AccountInfoString(ACCOUNT_CURRENCY), have);
          return;
         }
      }
@@ -1080,25 +1121,29 @@ void OpenCopy(const int k)
      {
       g_opened++;
       MarkHandled(g_mTicket[k], g_mVolume[k]);
-      g_lastMLot = g_mVolume[k];
-      g_lastSLot = lots;
+      ClearOpenFailure(g_mTicket[k]);
+      g_blockNote = "";
+      g_lastMLot  = g_mVolume[k];
+      g_lastSLot  = lots;
       PrintFormat("Copier: %s %.2f %s copying master #%I64u (master %.2f lots).",
                   (buy ? "BUY" : "SELL"), lots, sym, g_mTicket[k], g_mVolume[k]);
      }
    else
      {
       g_errors++;
-      g_stopNote = StringFormat("open rejected %d (%s)",
-                                (int)trade.ResultRetcode(),
-                                RetcodeHint((int)trade.ResultRetcode()));
-      PrintFormat("Copier: open failed for %s %.2f lots. retcode=%d (%s) - %s"
-                  "  [SL %s TP %s, market %s/%s]",
-                  sym, lots, trade.ResultRetcode(), trade.ResultRetcodeDescription(),
-                  RetcodeHint((int)trade.ResultRetcode()),
-                  DoubleToString(sl, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
-                  DoubleToString(tp, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
-                  DoubleToString(bid, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
-                  DoubleToString(ask, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)));
+      int rc = (int)trade.ResultRetcode();
+      g_stopNote  = StringFormat("open rejected %d (%s)", rc, RetcodeHint(rc));
+      g_blockNote = StringFormat("broker refused: %s", RetcodeHint(rc));
+      int nfail  = NoteOpenFailure(g_mTicket[k]);
+      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      if(nfail == 1 || nfail % 20 == 0)
+        {
+         PrintFormat("Copier: NOT COPYING - open failed for %s %.2f lots. "
+                     "retcode=%d (%s) - %s  [SL %s TP %s, market %s/%s]",
+                     sym, lots, rc, trade.ResultRetcodeDescription(), RetcodeHint(rc),
+                     DoubleToString(sl,  digits), DoubleToString(tp,  digits),
+                     DoubleToString(bid, digits), DoubleToString(ask, digits));
+        }
      }
   }
 
@@ -1346,6 +1391,64 @@ string RetcodeHint(const int rc)
 //| Short back-off for an operation the broker just refused           |
 //+------------------------------------------------------------------+
 #define FAIL_BACKOFF_SEC 5
+
+//+------------------------------------------------------------------+
+//| Entry back-off, keyed by master ticket.                           |
+//|                                                                   |
+//| Returns true while we should not try this trade again. The delay   |
+//| doubles per failure to a 30 s ceiling, so a copy that genuinely    |
+//| cannot be placed costs a couple of log lines a minute rather than  |
+//| ten errors a second - and the reason stays readable in the log     |
+//| instead of scrolling past hundreds of identical repeats.           |
+//+------------------------------------------------------------------+
+bool OpenRecentlyFailed(const ulong masterTicket)
+  {
+   uint now = GetTickCount();
+   for(int i = 0; i < g_openN; i++)
+      if(g_openTicket[i] == masterTicket)
+         return(now - g_openWhen[i] < BackoffMs(g_openCount[i]));
+   return(false);
+  }
+
+// Returns how many times this trade has now failed, so the caller can
+// log the first one and then only occasionally.
+int NoteOpenFailure(const ulong masterTicket)
+  {
+   uint now = GetTickCount();
+   for(int i = 0; i < g_openN; i++)
+      if(g_openTicket[i] == masterTicket)
+        {
+         g_openWhen[i] = now;
+         g_openCount[i]++;
+         return(g_openCount[i]);
+        }
+
+   if(g_openN < MAX_POS)
+     {
+      g_openTicket[g_openN] = masterTicket;
+      g_openWhen[g_openN]   = now;
+      g_openCount[g_openN]  = 1;
+      g_openN++;
+      return(1);
+     }
+
+   int oldest = 0;
+   for(int i = 1; i < g_openN; i++)
+      if(g_openWhen[i] < g_openWhen[oldest])
+         oldest = i;
+   g_openTicket[oldest] = masterTicket;
+   g_openWhen[oldest]   = now;
+   g_openCount[oldest]  = 1;
+   return(1);
+  }
+
+// A trade that finally went on should not carry its old failures.
+void ClearOpenFailure(const ulong masterTicket)
+  {
+   for(int i = 0; i < g_openN; i++)
+      if(g_openTicket[i] == masterTicket)
+        { g_openCount[i] = 0; g_openWhen[i] = 0; return; }
+  }
 
 bool RecentlyFailed(const ulong ticket)
   {
@@ -1922,6 +2025,12 @@ void PanelUpdate()
               ? "ABSOLUTE - master's exact levels"
               : "DISTANCE - master's distances") +
              (g_lastSlip > 0.0 ? StringFormat("   entry %.0f pts off", g_lastSlip) : ""));
+   // The master is holding trades and this account has none of them. That
+   // is the state worth shouting about, and it always has exactly one
+   // reason - which is the thing an error count alone never told you.
+   if(g_blockNote != "" && g_mCount > 0 && CountCopies() == 0)
+      PanelLine(row++, "NOT COPYING", clrOrangeRed, g_blockNote);
+
    // Whatever last went wrong, in words. An error counter on its own never
    // said which of a dozen possible causes was actually in play.
    if(g_stopNote != "")
